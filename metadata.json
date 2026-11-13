@@ -1,0 +1,6 @@
+{
+  "name": "فتّشها - تحداك في كل كلمة",
+  "description": "لعبة الكلمات والشبكات العربية التفاعلية بهوية كويتية شبابية، تدعم اللعب الفردي، والمحلي، والأونلاين الفوري، ووضع Android TV.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
