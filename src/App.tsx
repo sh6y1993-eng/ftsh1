@@ -34,7 +34,9 @@ import { sounds } from './utils/audio';
 import {
   saveUserToLocalMap,
   getLocalUserProfile,
-  safeApiJson
+  safeApiJson,
+  supabase,
+  buildProfileFromSupabaseUser
 } from './services/supabaseClient';
 
 export default function App() {
@@ -81,8 +83,29 @@ export default function App() {
     }
   };
 
-  // Load initial player on start using saved active user (works on Node, Supabase, Vercel & Netlify)
+  // Load initial player on start & listen for verified Supabase OAuth / OTP sessions
   useEffect(() => {
+    let authSub: { unsubscribe: () => void } | null = null;
+
+    if (supabase) {
+      supabase.auth.getSession().then(async ({ data }) => {
+        if (data?.session?.user) {
+          const verifiedProfile = await buildProfileFromSupabaseUser(data.session.user);
+          handleSelectActiveProfile(verifiedProfile);
+          setCurrentScreen(prev => (prev === 'AUTH' || prev === 'SPLASH' ? 'HOME' : prev));
+        }
+      });
+
+      const { data: listener } = supabase.auth.onAuthStateChange(async (event, session) => {
+        if ((event === 'SIGNED_IN' || event === 'TOKEN_REFRESHED') && session?.user) {
+          const verifiedProfile = await buildProfileFromSupabaseUser(session.user);
+          handleSelectActiveProfile(verifiedProfile);
+          setCurrentScreen(prev => (prev === 'AUTH' || prev === 'SPLASH' ? 'HOME' : prev));
+        }
+      });
+      authSub = listener.subscription;
+    }
+
     const fetchUser = async () => {
       try {
         let savedUser = '';
@@ -112,6 +135,10 @@ export default function App() {
       }
     };
     fetchUser();
+
+    return () => {
+      authSub?.unsubscribe();
+    };
   }, []);
 
   // Maintain global WebSocket presence so friends see online status & receive instant private room invites
