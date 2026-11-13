@@ -7,6 +7,8 @@ interface WordBankProps {
   foundWords: string[];
   playerColorMap?: Record<string, string>;
   playerNamesMap?: Record<string, string>;
+  playerIdsMap?: Record<string, string>;
+  currentPlayerId?: string;
   currentPlayerName?: string;
   hintWord?: string | null;
 }
@@ -16,6 +18,8 @@ export const WordBank: React.FC<WordBankProps> = ({
   foundWords,
   playerColorMap = {},
   playerNamesMap = {},
+  playerIdsMap = {},
+  currentPlayerId,
   currentPlayerName,
   hintWord
 }) => {
@@ -59,9 +63,12 @@ export const WordBank: React.FC<WordBankProps> = ({
           const isHinted = !isFound && hintWord === placement.word;
           const color = playerColorMap[placement.word] || placement.color;
           const claimedBy = playerNamesMap[placement.word];
-          const isMine =
-            claimedBy &&
-            (color === '#0ea5e9' || (currentPlayerName && claimedBy === currentPlayerName));
+          const claimedById = playerIdsMap[placement.word] || placement.foundBy;
+          const isMine = Boolean(
+            claimedById && currentPlayerId
+              ? claimedById === currentPlayerId
+              : claimedBy && currentPlayerName && claimedBy === currentPlayerName
+          );
 
           return (
             <div
@@ -109,7 +116,7 @@ export const WordBank: React.FC<WordBankProps> = ({
               )}
               {claimedBy && (
                 <span className="text-[10px] sm:text-[11px] bg-black/40 px-2 py-0.5 rounded-full mr-1 font-black border border-white/25 whitespace-nowrap">
-                  {isMine ? `✓ صدتها أنت` : `صادها: ${claimedBy.split(' ')[0]}`}
+                  {isMine ? `✓ صدتها أنت` : `✗ صادها: ${claimedBy}`}
                 </span>
               )}
             </div>

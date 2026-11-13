@@ -1591,8 +1591,15 @@ app.post('/api/rooms/join', (req, res) => {
     });
   }
 
+  const existingOther = Object.values(room.players).find(p => p.id !== player.id);
+  const finalDisplayName =
+    existingOther && existingOther.displayName === player.displayName
+      ? `${player.displayName} (2)`
+      : room.players[player.id]?.displayName || player.displayName;
+
   room.players[player.id] = {
     ...player,
+    displayName: finalDisplayName,
     isHost,
     score: room.players[player.id]?.score || 0,
     wordsFound: room.players[player.id]?.wordsFound || [],

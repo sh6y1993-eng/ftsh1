@@ -4,6 +4,11 @@ import { X, Check, User } from 'lucide-react';
 import { sounds } from '../utils/audio';
 import loginMascotImage from '../assets/images/login_kuwaiti_mascot_1794483388654.jpg';
 
+import {
+  loginOrRegisterAccount,
+  loginAsGuestAccount
+} from '../services/supabaseClient';
+
 interface AuthScreenProps {
   onLoginSuccess: (user: PlayerProfile) => void;
   onNavigate: (screen: ScreenState) => void;
@@ -23,50 +28,29 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
   // Reliable image source with bundled Vite import and public fallback
   const mascotSrc = loginMascotImage || '/assets/images/login_kuwaiti_mascot_1794483388654.jpg';
 
-  // Sign in with an existing or new Google account profile
-  const handleGoogleAccountSelect = async (username: string, displayName?: string, avatar?: string) => {
+  // Sign in with an existing or new Google account profile (works on Supabase, Node, Vercel & Netlify)
+  const handleGoogleAccountSelect = async (
+    username: string,
+    displayName?: string,
+    avatar?: string,
+    email?: string
+  ) => {
     sounds.playTap();
     setLoading(true);
     setError('');
 
     try {
-      // Try logging in first
-      const loginRes = await fetch('/api/auth/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password: '123456' })
+      const profile = await loginOrRegisterAccount({
+        username,
+        displayName: displayName || username,
+        email,
+        avatar: avatar || '/assets/images/avatar_kuwaiti_boy_1794404782928.jpg'
       });
-      const loginData = await loginRes.json();
-
-      if (loginData.success && loginData.user) {
-        sounds.playVictory();
-        setShowGoogleModal(false);
-        onLoginSuccess(loginData.user);
-        return;
-      }
-
-      // If account doesn't exist yet, register it seamlessly
-      const regRes = await fetch('/api/auth/register', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          username,
-          displayName: displayName || username,
-          password: '123456',
-          avatar: avatar || '/assets/images/avatar_kuwaiti_boy_1794404782928.jpg'
-        })
-      });
-      const regData = await regRes.json();
-
-      if (regData.success && regData.user) {
-        sounds.playVictory();
-        setShowGoogleModal(false);
-        onLoginSuccess(regData.user);
-      } else {
-        setError(regData.error || 'تعذر تسجيل الدخول');
-      }
+      sounds.playVictory();
+      setShowGoogleModal(false);
+      onLoginSuccess(profile);
     } catch {
-      setError('تعذر الاتصال بالخادم، يرجى المحاولة مرة أخرى');
+      setError('تعذر تسجيل الدخول، يرجى المحاولة مرة أخرى');
     } finally {
       setLoading(false);
     }
@@ -75,46 +59,35 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
   // Handle custom Google email form submission
   const handleCustomGoogleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    const cleanUsername = customEmail
-      .trim()
-      .toLowerCase()
-      .split('@')[0]
-      .replace(/[^a-z0-9_]/g, '_') || `google_${Date.now()}`;
-    const nameToUse = customName.trim() || cleanUsername;
-    handleGoogleAccountSelect(cleanUsername, nameToUse);
+    const rawEmail = customEmail.trim().toLowerCase();
+    const rawName = customName.trim();
+    if (!rawEmail && !rawName) {
+      setError('يرجى إدخال الاسم أو البريد الإلكتروني للمتابعة');
+      return;
+    }
+    const emailPrefix = rawEmail ? rawEmail.split('@')[0] : rawName;
+    const cleanUsername =
+      emailPrefix.replace(/[^a-z0-9_]/gi, '_').toLowerCase() ||
+      `user_${Date.now().toString(36)}`;
+    const nameToUse = rawName || emailPrefix || 'لاعب فتّشها';
+    handleGoogleAccountSelect(
+      cleanUsername,
+      nameToUse,
+      '/assets/images/avatar_kuwaiti_boy_1794404782928.jpg',
+      rawEmail || `${cleanUsername}@gmail.com`
+    );
   };
 
-  // Continue as Guest (creates or loads an isolated Guest account starting at 0 stars)
+  // Continue as Guest (creates or loads an isolated Guest account with a unique tag per session)
   const handleContinueAsGuest = async () => {
     sounds.playTap();
     setLoading(true);
     setError('');
 
     try {
-      let guestId = '';
-      try {
-        guestId = localStorage.getItem('fatteshha_guest_id') || '';
-        if (!guestId) {
-          guestId = `guest_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
-          localStorage.setItem('fatteshha_guest_id', guestId);
-        }
-      } catch {
-        guestId = `guest_${Date.now()}`;
-      }
-
-      const res = await fetch('/api/auth/guest', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ guestId })
-      });
-      const data = await res.json();
-
-      if (data.success && data.user) {
-        sounds.playVictory();
-        onLoginSuccess(data.user);
-      } else {
-        onNavigate('HOME');
-      }
+      const guestUser = await loginAsGuestAccount();
+      sounds.playVictory();
+      onLoginSuccess(guestUser);
     } catch {
       onNavigate('HOME');
     } finally {

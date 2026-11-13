@@ -94,6 +94,8 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
   const wsRef = useRef<WebSocket | null>(null);
   const userRef = useRef(user);
   userRef.current = user;
+  const activeRoomRef = useRef<OnlineRoom | null>(null);
+  activeRoomRef.current = activeRoom;
 
   // Sync default room name when active user changes
   useEffect(() => {
@@ -103,22 +105,40 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
     }
   }, [user?.displayName]);
 
-  // Unique per-tab player ID so 2 tabs or 2 devices can play 1v1 together
+  // Unique per-tab player ID so 2 tabs (even duplicated tabs) or 2 devices can play 1v1 together
   const tabPlayerIdRef = useRef<string>('');
+  const tabGuestNameRef = useRef<string>('');
   if (!tabPlayerIdRef.current) {
     const baseId = user?.id || 'guest';
+    const isFreshOrDuplicatedWindow =
+      typeof window !== 'undefined' && (!window.name || !window.name.startsWith('fts_win_'));
+    if (isFreshOrDuplicatedWindow && typeof window !== 'undefined') {
+      window.name = `fts_win_${Math.random().toString(36).substring(2, 8)}`;
+      sessionStorage.removeItem('fatteshha_online_tab_id');
+      sessionStorage.removeItem('fatteshha_online_tab_name');
+    }
     let storedTabId = sessionStorage.getItem('fatteshha_online_tab_id');
     if (!storedTabId) {
       storedTabId = `${baseId}_${Math.random().toString(36).substring(2, 7)}`;
       sessionStorage.setItem('fatteshha_online_tab_id', storedTabId);
     }
+    let storedTabName = sessionStorage.getItem('fatteshha_online_tab_name');
+    if (!storedTabName) {
+      const tag = Math.floor(100 + Math.random() * 899);
+      storedTabName = `ضيف فتّشها #${tag}`;
+      sessionStorage.setItem('fatteshha_online_tab_name', storedTabName);
+    }
     tabPlayerIdRef.current = storedTabId;
+    tabGuestNameRef.current = storedTabName;
   }
 
   const getPlayerPayload = () => ({
     id: tabPlayerIdRef.current,
-    username: userRef.current?.username || 'ahmad_kwt',
-    displayName: userRef.current?.displayName || 'لاعب كويتي',
+    username: userRef.current?.username || `guest_${tabPlayerIdRef.current.slice(-4)}`,
+    displayName:
+      userRef.current?.displayName && userRef.current.displayName !== 'لاعب كويتي'
+        ? userRef.current.displayName
+        : tabGuestNameRef.current || 'ضيف فتّشها',
     avatar: userRef.current?.avatar || '/assets/images/avatar_kuwaiti_boy_1794404782928.jpg'
   });
 
@@ -530,7 +550,7 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
 
     // Immediate REST fallback + infallible client-side creation for Netlify static host
     setTimeout(async () => {
-      if (completed || activeRoom) {
+      if (completed || activeRoomRef.current) {
         setIsSubmitting(false);
         return;
       }
@@ -551,13 +571,20 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
         const data = await res.json();
         if (data.success && data.room) {
           completed = true;
-          setActiveRoom(data.room);
+          if (!activeRoomRef.current) {
+            setActiveRoom(data.room);
+          }
           setErrorMsg('');
           setIsSubmitting(false);
           return;
         }
       } catch (err) {
         console.warn('Backend server unreachable (e.g. static hosting on Netlify). Activating local room engine:', err);
+      }
+
+      if (completed || activeRoomRef.current) {
+        setIsSubmitting(false);
+        return;
       }
 
       // If backend was unreachable (e.g. on Netlify where /api/rooms/create gives 404):
@@ -700,9 +727,24 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
     // Check locally stored room (if running on same machine/browser)
     const localRoom = getRoomLocally(cleanCode);
     if (localRoom) {
-      localRoom.players[currentPlayer.id] = guestPlayer;
+      let guestId = currentPlayer.id;
+      if (guestId === localRoom.hostId) {
+        guestId = `${guestId}_p2`;
+        tabPlayerIdRef.current = guestId;
+        sessionStorage.setItem('fatteshha_online_tab_id', guestId);
+      }
+      const existingHost = Object.values(localRoom.players).find(p => p.id !== guestId);
+      const safeName =
+        existingHost && existingHost.displayName === guestPlayer.displayName
+          ? `${guestPlayer.displayName} (2)`
+          : guestPlayer.displayName;
+      localRoom.players[guestId] = {
+        ...guestPlayer,
+        id: guestId,
+        displayName: safeName
+      };
       saveRoomLocally(localRoom);
-      realtimeSync.publishToRoom(cleanCode, 'ROOM_UPDATED', { room: localRoom }, currentPlayer.id);
+      realtimeSync.publishToRoom(cleanCode, 'ROOM_UPDATED', { room: localRoom }, guestId);
       completed = true;
       setActiveRoom(localRoom);
       setErrorMsg('');
@@ -712,7 +754,7 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
 
     // If host hasn't responded within 3.5s, inform the user
     setTimeout(() => {
-      if (!completed && !activeRoom) {
+      if (!completed && !activeRoomRef.current) {
         setIsSubmitting(false);
         setErrorMsg(`لم يتم العثور على الغرفة (${cleanCode}) — تأكد من الرمز أو أن المضيف لا يزال داخل الغرفة.`);
       }
@@ -1035,10 +1077,19 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
         const guest: OnlineRoomPlayer = payload.player;
         setActiveRoom((cur) => {
           if (!cur || cur.code !== activeRoom.code) return cur;
+          const guestId = guest.id === cur.hostId ? `${guest.id}_p2` : guest.id;
+          const hostPlayer = cur.players[cur.hostId] || Object.values(cur.players)[0];
+          const safeDisplayName =
+            hostPlayer && hostPlayer.displayName === guest.displayName
+              ? `${guest.displayName} (2)`
+              : guest.displayName;
           const nextPlayers = {
             ...cur.players,
-            [guest.id]: {
+            [guestId]: {
               ...guest,
+              id: guestId,
+              displayName: safeDisplayName,
+              color: '#ec4899',
               isHost: false,
               isReady: true,
               connected: true,

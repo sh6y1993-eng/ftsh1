@@ -32,6 +32,7 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
   const [foundWords, setFoundWords] = useState<string[]>([]);
   const [wordPlayerMap, setWordPlayerMap] = useState<Record<string, string>>({});
   const [wordPlayerNameMap, setWordPlayerNameMap] = useState<Record<string, string>>({});
+  const [wordPlayerIdMap, setWordPlayerIdMap] = useState<Record<string, string>>({});
   const [opponentPath, setOpponentPath] = useState<{ row: number; col: number }[]>([]);
   const [raceFlash, setRaceFlash] = useState<{
     text: string;
@@ -56,15 +57,19 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
     'ريماتش؟ 🔄'
   ];
 
-  const playerId =
+  const rawPlayerId =
     myPlayerId ||
     sessionStorage.getItem('fatteshha_online_tab_id') ||
     currentUser?.id ||
     `guest_${Date.now()}`;
   const categoryObj = CATEGORIES.find(c => c.id === room.categoryId) || CATEGORIES[0];
   const playersList = Object.values(room.players);
-  const myPlayer = room.players[playerId] || playersList[0];
-  const opponent = playersList.find(p => p.id !== myPlayer?.id) || playersList[1];
+  const myPlayer =
+    room.players[rawPlayerId] ||
+    playersList.find(p => p.id === rawPlayerId) ||
+    playersList[0];
+  const playerId = myPlayer?.id || rawPlayerId;
+  const opponent = playersList.find(p => p.id !== playerId) || playersList[1];
 
   useEffect(() => {
     const handleMessage = (event: MessageEvent) => {
@@ -85,12 +90,20 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
             streak,
             room: updatedRoom
           } = payload;
+          const isClaimedByMe = String(claimerId) === String(playerId);
+          const resolvedColor = playerColor || (isClaimedByMe ? '#0ea5e9' : '#ec4899');
+          const resolvedName =
+            playerName ||
+            updatedRoom?.players?.[claimerId]?.displayName ||
+            (isClaimedByMe ? myPlayer?.displayName || 'أنت' : opponent?.displayName || 'الخصم');
+
           setRoom(updatedRoom);
           setOpponentPath([]);
 
           setFoundWords(prev => (prev.includes(word) ? prev : [...prev, word]));
-          setWordPlayerMap(prev => ({ ...prev, [word]: playerColor }));
-          setWordPlayerNameMap(prev => ({ ...prev, [word]: playerName }));
+          setWordPlayerMap(prev => ({ ...prev, [word]: resolvedColor }));
+          setWordPlayerNameMap(prev => ({ ...prev, [word]: resolvedName }));
+          setWordPlayerIdMap(prev => ({ ...prev, [word]: String(claimerId) }));
 
           const shownWord = displayWord || word;
           const pts = wordScore || 150;
@@ -100,8 +113,8 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
             id: string;
             score: number;
           }>;
-          const claimerUpdated = updatedPlayers.find(p => p.id === claimerId);
-          const rivalUpdated = updatedPlayers.find(p => p.id !== claimerId);
+          const claimerUpdated = updatedPlayers.find(p => String(p.id) === String(claimerId));
+          const rivalUpdated = updatedPlayers.find(p => String(p.id) !== String(claimerId));
           const prevClaimerScore = (claimerUpdated?.score || pts) - pts;
           const rivalScore = rivalUpdated?.score || 0;
           const tookLead =
@@ -109,7 +122,7 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
             prevClaimerScore <= rivalScore &&
             (claimerUpdated?.score || 0) > rivalScore;
 
-          if (claimerId === playerId) {
+          if (isClaimedByMe) {
             sounds.playMultiplayerWordScore(streak || 1, 0);
             if (tookLead) {
               setTimeout(() => sounds.playLeadChangeFanfare(), 240);
@@ -130,11 +143,11 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
             const comboTxt = streak && streak >= 2 ? ` (كومبو x${streak})` : '';
             const leadTxt = tookLead ? ' • انتزع الصدارة!' : '';
             setKuwaitiMsg(
-              `الخصم ${playerName} صاد كلمة «${shownWord}» قبلك وانحسبت له (+${pts} نقطة)${leadTxt}! ⚡`
+              `الخصم «${resolvedName}» صاد كلمة «${shownWord}» قبلك وانحسبت له (+${pts} نقطة)${leadTxt}! ⚡`
             );
             setCommentType('mistake');
             setRaceFlash({
-              text: `🚨 ${playerName} صاد «${shownWord}» قبلك!`,
+              text: `🚨 الخصم «${resolvedName}» صاد «${shownWord}» قبلك!`,
               subtext: `انحسبت للخصم (+${pts} نقطة)${comboTxt}${leadTxt}`,
               isMine: false
             });
@@ -175,6 +188,7 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
           setFoundWords([]);
           setWordPlayerMap({});
           setWordPlayerNameMap({});
+          setWordPlayerIdMap({});
           setOpponentPath([]);
           setRaceFlash(null);
           setGameFinished(false);
@@ -243,23 +257,33 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
         })
       );
     } else {
-      // Local / Netlify static fallback: claim word directly in client state
+      // Local / Netlify / Vercel static fallback: claim word directly in client state
       const placement = room.wordPlacements?.find(p => p.word === word);
       const displayWord = placement?.displayWord || word;
       const pts = 150;
+      const myColor = myPlayer?.color || (room.hostId === playerId ? '#0ea5e9' : '#ec4899');
+      const myName = myPlayer?.displayName || 'أنت';
       sounds.playMultiplayerWordScore(1, 0);
 
       // Publish word discovery over real-time cloud relay to the opponent
       realtimeSync.publishToRoom(
         room.code,
         'WORD_FOUND',
-        { word, playerId, displayWord, pts },
+        {
+          word,
+          playerId,
+          playerName: myName,
+          playerColor: myColor,
+          displayWord,
+          pts
+        },
         playerId
       );
 
       setFoundWords(prev => (prev.includes(word) ? prev : [...prev, word]));
-      setWordPlayerMap(prev => ({ ...prev, [word]: myPlayer?.color || '#0ea5e9' }));
-      setWordPlayerNameMap(prev => ({ ...prev, [word]: myPlayer?.displayName || 'أنت' }));
+      setWordPlayerMap(prev => ({ ...prev, [word]: myColor }));
+      setWordPlayerNameMap(prev => ({ ...prev, [word]: myName }));
+      setWordPlayerIdMap(prev => ({ ...prev, [word]: String(playerId) }));
 
       setKuwaitiMsg(`كفو! صدت كلمة «${displayWord}» وانحسبت لك (+${pts} نقطة)! ⚡`);
       setCommentType('praise');
@@ -316,34 +340,60 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
   useEffect(() => {
     realtimeSync.subscribeToRoom(room.code, (msg) => {
       const { type, payload, senderId } = msg;
-      if (senderId === playerId) return;
+      if (String(senderId) === String(playerId) || String(payload?.playerId) === String(playerId)) {
+        return;
+      }
 
       if (type === 'WORD_FOUND') {
-        const { word, playerId: finderId, displayWord: dw, pts } = payload;
-        const finder = room.players[finderId];
-        const finderColor = finder?.color || '#ec4899';
-        const finderName = finder?.displayName || 'الخصم';
+        const {
+          word,
+          playerId: finderId,
+          playerName: payloadFinderName,
+          playerColor: payloadFinderColor,
+          displayWord: dw,
+          pts
+        } = payload;
+        const finder =
+          room.players[finderId] ||
+          Object.values(room.players).find(p => String(p.id) !== String(playerId));
+        const resolvedFinderId = String(finder?.id || finderId || 'opponent');
+        const finderColor = finder?.color || payloadFinderColor || '#ec4899';
+        const finderName = finder?.displayName || payloadFinderName || 'الخصم';
+        const wordPts = pts || 150;
 
         setFoundWords(f => (f.includes(word) ? f : [...f, word]));
         setWordPlayerMap(m => ({ ...m, [word]: finderColor }));
         setWordPlayerNameMap(m => ({ ...m, [word]: finderName }));
-        sounds.playError();
+        setWordPlayerIdMap(m => ({ ...m, [word]: resolvedFinderId }));
+        sounds.playOpponentFound(1);
+        setKuwaitiMsg(
+          `الخصم «${finderName}» صاد كلمة «${dw || word}» قبلك وانحسبت له (+${wordPts} نقطة)! اسبق على الكلمات المتبقية ⚡`
+        );
+        setCommentType('mistake');
         setRaceFlash({
-          text: `خصمك «${finderName}» صاد كلمة «${dw}»!`,
-          subtext: `اسبق على الكلمات المتبقية`,
+          text: `🚨 الخصم «${finderName}» صاد «${dw || word}» قبلك!`,
+          subtext: `انحسبت للخصم (+${wordPts} نقطة) • اسبق على الكلمات المتبقية`,
           isMine: false
         });
 
         setRoom(cur => {
-          const finderP = cur.players[finderId];
-          const nextScore = (finderP?.score || 0) + (pts || 150);
-          const nextFound = [...(finderP?.wordsFound || []), word];
+          const targetKey = cur.players[resolvedFinderId]
+            ? resolvedFinderId
+            : Object.keys(cur.players).find(k => String(k) !== String(playerId)) || resolvedFinderId;
+          const finderP = cur.players[targetKey];
+          const prevWords = finderP?.wordsFound || [];
+          const alreadyHad = prevWords.includes(word);
+          const nextScore = alreadyHad ? finderP?.score || 0 : (finderP?.score || 0) + wordPts;
+          const nextFound = alreadyHad ? prevWords : [...prevWords, word];
           const updated = {
             ...cur,
             players: {
               ...cur.players,
-              [finderId]: {
+              [targetKey]: {
                 ...finderP,
+                id: targetKey,
+                displayName: finderP?.displayName || finderName,
+                color: finderP?.color || finderColor,
                 score: nextScore,
                 wordsFound: nextFound
               }
@@ -355,7 +405,7 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
           if (myCount + nextFound.length >= totalW) {
             setTimeout(() => {
               const myFinal = cur.players[playerId]?.score || 0;
-              const winner = myFinal >= nextScore ? myPlayer : finder;
+              const winner = myFinal >= nextScore ? myPlayer : updated.players[targetKey];
               setGameFinished(true);
               setWinnerInfo({ id: winner?.id, name: winner?.displayName || 'الفائز' });
               if (winner?.id === playerId) {
@@ -715,6 +765,8 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
         foundWords={foundWords}
         playerColorMap={wordPlayerMap}
         playerNamesMap={wordPlayerNameMap}
+        playerIdsMap={wordPlayerIdMap}
+        currentPlayerId={playerId}
         currentPlayerName={myPlayer?.displayName}
       />
 

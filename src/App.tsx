@@ -31,6 +31,11 @@ import { ProfileScreen } from './screens/ProfileScreen';
 import { SettingsScreen } from './screens/SettingsScreen';
 import { ResultsModal } from './screens/ResultsModal';
 import { sounds } from './utils/audio';
+import {
+  saveUserToLocalMap,
+  getLocalUserProfile,
+  safeApiJson
+} from './services/supabaseClient';
 
 export default function App() {
   const [currentScreen, setCurrentScreen] = useState<ScreenState>('SPLASH');
@@ -68,19 +73,15 @@ export default function App() {
     hintsUsedCount?: number;
   } | null>(null);
 
-  // Helper to update active profile and persist username in localStorage
+  // Helper to update active profile and persist in localStorage / Supabase
   const handleSelectActiveProfile = (profile: PlayerProfile | null) => {
     setActiveProfile(profile);
     if (profile?.username) {
-      try {
-        localStorage.setItem('fatteshha_active_user', profile.username);
-      } catch {
-        // ignore storage restrictions
-      }
+      saveUserToLocalMap(profile);
     }
   };
 
-  // Load initial player on start using saved active user
+  // Load initial player on start using saved active user (works on Node, Supabase, Vercel & Netlify)
   useEffect(() => {
     const fetchUser = async () => {
       try {
@@ -94,20 +95,20 @@ export default function App() {
         if (savedUser) {
           headers['x-user-id'] = savedUser;
         }
-        const res = await fetch('/api/auth/me', { headers });
-        const data = await res.json();
-        if (data.success && data.user) {
-          setActiveProfile(data.user);
-          if (data.user.username) {
-            try {
-              localStorage.setItem('fatteshha_active_user', data.user.username);
-            } catch {
-              // ignore
-            }
-          }
+        const data = await safeApiJson<{ success?: boolean; user?: PlayerProfile }>('/api/auth/me', { headers });
+        if (data?.success && data.user) {
+          handleSelectActiveProfile(data.user);
+          return;
         }
-      } catch (err) {
-        console.error('Failed to fetch initial profile:', err);
+        const localFallback = getLocalUserProfile(savedUser);
+        if (localFallback) {
+          setActiveProfile(localFallback);
+        }
+      } catch {
+        const localFallback = getLocalUserProfile();
+        if (localFallback) {
+          setActiveProfile(localFallback);
+        }
       }
     };
     fetchUser();
@@ -173,7 +174,15 @@ export default function App() {
     hintsUsedCount: number = 0
   ) => {
     try {
-      const res = await fetch('/api/progress/complete-level', {
+      const data = await safeApiJson<{
+        success?: boolean;
+        user?: PlayerProfile;
+        earnedXP?: number;
+        earnedCoins?: number;
+        levelUp?: boolean;
+        streakReward?: { currentStreak: number; bonusCoins: number; longestStreak: number } | null;
+        completedDailyTasks?: import('./types/game').DailyChallengeTask[];
+      }>('/api/progress/complete-level', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -188,9 +197,8 @@ export default function App() {
           hintsUsedCount
         })
       });
-      const data = await res.json();
 
-      if (data.success && data.user) {
+      if (data?.success && data.user) {
         handleSelectActiveProfile(data.user);
         setResultsData({
           stars,
@@ -205,28 +213,60 @@ export default function App() {
           completedDailyTasks: data.completedDailyTasks || [],
           hintsUsedCount
         });
-      } else {
-        setResultsData({
-          stars,
-          timeSpent,
-          score,
-          earnedXP: 140,
-          earnedCoins: 175,
-          levelUp: false,
-          wordsFoundCount,
-          totalWordsCount: selectedLevelInfo.words.length || wordsFoundCount,
-          streakReward: null,
-          completedDailyTasks: [],
-          hintsUsedCount
-        });
+        return;
       }
     } catch {
+      // Fallback to local calculation below
+    }
+
+    // Local / Static host (Vercel / Netlify) progression update
+    const earnedXP = 50 + stars * 20 + Math.max(0, 100 - Math.floor(timeSpent));
+    const earnedCoins = 10 + stars * 5;
+    if (activeProfile) {
+      const levelKey = `${selectedCategory.id}_${selectedLevelInfo.levelNumber}`;
+      const existing = activeProfile.completedLevels?.[levelKey];
+      const nextCompleted = {
+        ...(activeProfile.completedLevels || {}),
+        [levelKey]: {
+          stars: Math.max(existing?.stars || 0, stars),
+          bestTime: existing ? Math.min(existing.bestTime, timeSpent) : timeSpent,
+          score: existing ? Math.max(existing.score, score) : score,
+          accuracy: existing?.accuracy ? Math.max(existing.accuracy, accuracy) : accuracy,
+          completedAt: new Date().toISOString()
+        }
+      };
+      const nextXP = (activeProfile.xp || 0) + earnedXP;
+      const prevLevel = Math.floor((activeProfile.xp || 0) / 300) + 1;
+      const nextLevel = Math.floor(nextXP / 300) + 1;
+      const updatedUser: PlayerProfile = {
+        ...activeProfile,
+        xp: nextXP,
+        level: nextLevel,
+        coins: (activeProfile.coins || 0) + earnedCoins,
+        completedLevels: nextCompleted,
+        completedLevelsCount: Object.keys(nextCompleted).length
+      };
+      handleSelectActiveProfile(updatedUser);
       setResultsData({
         stars,
         timeSpent,
         score,
-        earnedXP: 140,
-        earnedCoins: 175,
+        earnedXP,
+        earnedCoins,
+        levelUp: nextLevel > prevLevel,
+        wordsFoundCount,
+        totalWordsCount: selectedLevelInfo.words.length || wordsFoundCount,
+        streakReward: null,
+        completedDailyTasks: [],
+        hintsUsedCount
+      });
+    } else {
+      setResultsData({
+        stars,
+        timeSpent,
+        score,
+        earnedXP,
+        earnedCoins,
         levelUp: false,
         wordsFoundCount,
         totalWordsCount: selectedLevelInfo.words.length || wordsFoundCount,
