@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { WordPlacement } from '../types/game';
 import { getLineBetweenCells, getStringFromCells } from '../engine/wordSearch';
+import { getBoardThemeById, getTrailStyleById } from '../engine/gameCategories';
 import { sounds } from '../utils/audio';
 
 interface GameBoardProps {
@@ -17,6 +18,12 @@ interface GameBoardProps {
   onWordMistake?: () => void;
   hintCell?: { row: number; col: number } | null;
   hintPlacement?: WordPlacement | null;
+  revealedCells?: { row: number; col: number; label?: string }[];
+  dimUnusedCells?: boolean;
+  boardThemeId?: string;
+  trailStyleId?: string;
+  frozenSeconds?: number;
+  sandstormSeconds?: number;
   tvMode?: boolean;
 }
 
@@ -34,8 +41,18 @@ export const GameBoard: React.FC<GameBoardProps> = ({
   onWordMistake,
   hintCell,
   hintPlacement,
+  revealedCells = [],
+  dimUnusedCells = false,
+  boardThemeId,
+  trailStyleId,
+  frozenSeconds = 0,
+  sandstormSeconds = 0,
   tvMode = false
 }) => {
+  const activeBoardTheme = getBoardThemeById(boardThemeId);
+  const activeTrailStyle = getTrailStyleById(trailStyleId);
+  const isBoardFrozen = frozenSeconds > 0;
+  const isSandstormActive = sandstormSeconds > 0;
   const [isDragging, setIsDragging] = useState(false);
   const [startCell, setStartCell] = useState<{ row: number; col: number } | null>(null);
   const [currentPath, setCurrentPath] = useState<{ row: number; col: number }[]>([]);
@@ -59,6 +76,31 @@ export const GameBoard: React.FC<GameBoardProps> = ({
     });
     return map;
   }, [wordPlacements, foundWords, playerColorMap]);
+
+  // Set of cells belonging to any remaining unfound word (used when dimUnusedCells === true)
+  const activeWordCellsSet = React.useMemo(() => {
+    const set = new Set<string>();
+    wordPlacements.forEach(placement => {
+      if (!foundWords.includes(placement.word)) {
+        placement.cells.forEach(c => {
+          set.add(`${c.row},${c.col}`);
+        });
+      }
+    });
+    return set;
+  }, [wordPlacements, foundWords]);
+
+  // Map of cells revealed by SINGLE_LETTER or WORD_START hints
+  const revealedCellMap = React.useMemo(() => {
+    const map = new Map<string, string>();
+    revealedCells.forEach(rc => {
+      const key = `${rc.row},${rc.col}`;
+      if (!cellColorMap.has(key)) {
+        map.set(key, rc.label || '💡');
+      }
+    });
+    return map;
+  }, [revealedCells, cellColorMap]);
 
   // Map of cells belonging to the active Hint word placement (cellKey -> 0-based letter index in word)
   const hintCellIndexMap = React.useMemo(() => {
@@ -103,6 +145,10 @@ export const GameBoard: React.FC<GameBoardProps> = ({
 
   // Pointer event handlers for touch and mouse dragging
   const handlePointerDown = (row: number, col: number) => {
+    if (isBoardFrozen) {
+      sounds.playError();
+      return;
+    }
     sounds.playTap();
     setIsDragging(true);
     setStartCell({ row, col });
@@ -112,7 +158,7 @@ export const GameBoard: React.FC<GameBoardProps> = ({
   };
 
   const handlePointerEnter = (row: number, col: number) => {
-    if (!isDragging || !startCell) return;
+    if (isBoardFrozen || !isDragging || !startCell) return;
     const line = getLineBetweenCells(startCell.row, startCell.col, row, col);
     if (line) {
       setCurrentPath(line);
@@ -122,6 +168,12 @@ export const GameBoard: React.FC<GameBoardProps> = ({
   };
 
   const handlePointerUp = () => {
+    if (isBoardFrozen) {
+      setIsDragging(false);
+      setCurrentPath([]);
+      setStartCell(null);
+      return;
+    }
     if (isDragging && currentPath.length > 0) {
       finishSelection(currentPath);
     } else if (isDragging) {
@@ -211,15 +263,18 @@ export const GameBoard: React.FC<GameBoardProps> = ({
 
   // Determine cell classes & styles matching طاوله اللعب.png
   const getCellClasses = (r: number, c: number) => {
+    const key = `${r},${c}`;
     const isSelected = isInCurrentPath(r, c);
     const isOpponentScanning = isInOpponentPath(r, c);
     const isTvFocused = tvMode && tvFocus.row === r && tvFocus.col === c;
-    const hintIdx = hintCellIndexMap.get(`${r},${c}`);
+    const hintIdx = hintCellIndexMap.get(key);
     const isHint = hintIdx !== undefined;
-    const foundColor = cellColorMap.get(`${r},${c}`);
+    const isRevealedHint = revealedCellMap.has(key);
+    const foundColor = cellColorMap.get(key);
+    const isUnusedDimmed = dimUnusedCells && !foundColor && !activeWordCellsSet.has(key);
 
     let base =
-      'relative flex items-center justify-center font-extrabold select-none cursor-pointer transition-transform duration-100 rounded-xl ';
+      'relative flex items-center justify-center font-extrabold select-none cursor-pointer transition-all duration-150 rounded-xl ';
 
     // Wide beveled pill-tile sizing based on gridSize
     if (gridSize <= 8) {
@@ -231,11 +286,13 @@ export const GameBoard: React.FC<GameBoardProps> = ({
     }
 
     if (isSelected) {
-      base += 'text-slate-950 scale-105 z-10 font-black ';
-    } else if (isHint) {
-      base += 'text-slate-950 font-black z-20 hint-word-reveal-cell ring-2 ring-amber-300 ';
+      base += `${activeTrailStyle.selectedTextClass} scale-105 z-10 font-black `;
+    } else if (isHint || isRevealedHint) {
+      base += 'text-slate-950 font-black z-20 ring-2 ring-amber-300 ';
     } else if (foundColor) {
       base += 'text-white font-black ';
+    } else if (isUnusedDimmed) {
+      base += 'text-slate-600 opacity-25 scale-90 ';
     } else {
       base += 'text-white hover:brightness-110 ';
     }
@@ -286,40 +343,72 @@ export const GameBoard: React.FC<GameBoardProps> = ({
 
       <div
         ref={boardRef}
-        className="letter-grid p-3 sm:p-5 rounded-3xl backdrop-blur-md relative"
+        className="letter-grid p-3 sm:p-5 rounded-3xl backdrop-blur-md relative overflow-hidden"
         style={{
           display: 'grid',
           gridTemplateColumns: `repeat(${gridSize}, minmax(0, 1fr))`,
           gap: gridSize > 10 ? '5px' : '7px',
-          background: 'linear-gradient(180deg, rgba(8, 30, 48, 0.94) 0%, rgba(4, 15, 26, 0.97) 100%)',
-          border: '2px solid rgba(56, 189, 248, 0.65)',
-          boxShadow:
-            '0 0 36px rgba(14, 165, 233, 0.28), inset 0 0 24px rgba(14, 165, 233, 0.14), inset 0 1px 1px rgba(255, 255, 255, 0.2)'
+          background: activeBoardTheme.boardBackground,
+          border: isBoardFrozen
+            ? '2px solid rgba(103, 232, 249, 0.95)'
+            : isSandstormActive
+            ? '2px solid rgba(245, 158, 11, 0.95)'
+            : activeBoardTheme.boardBorder,
+          boxShadow: isBoardFrozen
+            ? '0 0 42px rgba(56, 189, 248, 0.55), inset 0 0 36px rgba(186, 230, 253, 0.35)'
+            : activeBoardTheme.boardShadow
         }}
       >
+        {/* Battle Card Effect Overlay: Frozen Board (❄️ تجميد الخصم) */}
+        {isBoardFrozen && (
+          <div className="absolute inset-0 z-40 bg-cyan-950/70 backdrop-blur-[3px] flex flex-col items-center justify-center gap-2 text-center p-4 pointer-events-auto">
+            <div className="text-5xl animate-bounce">❄️</div>
+            <div className="px-4 py-1.5 rounded-full bg-cyan-400 text-slate-950 font-black text-sm shadow-lg">
+              لوحتك متجمدة بفعل كرت الخصم!
+            </div>
+            <div className="text-xs font-black text-cyan-200 font-mono">
+              ينفك التجميد خلال {frozenSeconds} ثانية...
+            </div>
+          </div>
+        )}
+
+        {/* Battle Card Effect Overlay: Kuwaiti Sandstorm (🌫️ عاصفة رملية) */}
+        {isSandstormActive && !isBoardFrozen && (
+          <div className="pointer-events-none absolute inset-x-0 top-2 z-30 flex justify-center">
+            <span className="px-3 py-1 rounded-full bg-amber-500/90 text-slate-950 text-[11px] font-black shadow-lg animate-pulse">
+              🌫️ عاصفة رملية على لوحتك! ({sandstormSeconds}ث)
+            </span>
+          </div>
+        )}
+
         {grid.map((row, rIdx) =>
           row.map((letter, cIdx) => {
-            const foundColor = cellColorMap.get(`${rIdx},${cIdx}`);
+            const key = `${rIdx},${cIdx}`;
+            const foundColor = cellColorMap.get(key);
             const isSelected = isInCurrentPath(rIdx, cIdx);
             const isOpponentScanning = isInOpponentPath(rIdx, cIdx);
-            const hintIdx = hintCellIndexMap.get(`${rIdx},${cIdx}`);
+            const hintIdx = hintCellIndexMap.get(key);
             const isHint = hintIdx !== undefined;
             const isHintStart = hintIdx === 0;
+            const revealedBadge = revealedCellMap.get(key);
+            const isRevealedHint = revealedBadge !== undefined;
             const isOpponentLeadCell =
               opponentPath.length > 0 &&
               opponentPath[opponentPath.length - 1].row === rIdx &&
               opponentPath[opponentPath.length - 1].col === cIdx;
+            const isSandBlurred =
+              isSandstormActive && !foundColor && !isSelected && (rIdx + cIdx) % 2 === 0;
 
             let cellStyle: React.CSSProperties;
             if (isSelected) {
               cellStyle = {
-                background: 'linear-gradient(180deg, #fbbf24 0%, #f59e0b 100%)',
-                border: '1.5px solid #fef08a',
-                boxShadow: '0 0 16px rgba(245, 158, 11, 0.6), inset 0 1px 1px rgba(255,255,255,0.5)'
+                background: activeTrailStyle.selectedBackground,
+                border: activeTrailStyle.selectedBorder,
+                boxShadow: activeTrailStyle.selectedShadow
               };
-            } else if (isHint) {
+            } else if (isHint || isRevealedHint) {
               cellStyle = {
-                background: isHintStart
+                background: isHintStart || isRevealedHint
                   ? 'linear-gradient(135deg, #fde047 0%, #f59e0b 100%)'
                   : 'linear-gradient(135deg, #67e8f9 0%, #38bdf8 55%, #facc15 100%)',
                 border: '2px solid #ffffff',
@@ -339,8 +428,8 @@ export const GameBoard: React.FC<GameBoardProps> = ({
               };
             } else {
               cellStyle = {
-                background: 'linear-gradient(180deg, #163a59 0%, #0b2136 100%)',
-                border: '1.5px solid rgba(125, 211, 252, 0.42)',
+                background: activeBoardTheme.cellBackground,
+                border: activeBoardTheme.cellBorder,
                 boxShadow: '0 3px 6px rgba(0, 0, 0, 0.45), inset 0 1px 1px rgba(255, 255, 255, 0.22)'
               };
             }
@@ -348,12 +437,12 @@ export const GameBoard: React.FC<GameBoardProps> = ({
             return (
               <div
                 key={`${rIdx}-${cIdx}`}
-                className={getCellClasses(rIdx, cIdx)}
+                className={`${getCellClasses(rIdx, cIdx)} ${isSandBlurred ? 'blur-[4px] opacity-45' : ''}`}
                 style={cellStyle}
                 onPointerDown={() => handlePointerDown(rIdx, cIdx)}
                 onPointerEnter={() => handlePointerEnter(rIdx, cIdx)}
               >
-                <span className={isHint || isSelected ? 'drop-shadow-none font-black' : 'drop-shadow-[0_1px_2px_rgba(0,0,0,0.7)]'}>
+                <span className={isHint || isRevealedHint || isSelected ? 'drop-shadow-none font-black' : 'drop-shadow-[0_1px_2px_rgba(0,0,0,0.7)]'}>
                   {letter}
                 </span>
 
@@ -367,6 +456,12 @@ export const GameBoard: React.FC<GameBoardProps> = ({
                     }`}
                   >
                     {isHintStart ? '1 • ابدأ' : (hintIdx || 0) + 1}
+                  </span>
+                )}
+
+                {!isHint && isRevealedHint && (
+                  <span className="pointer-events-none absolute -top-2 -right-1.5 px-1.5 py-0.2 rounded-full text-[8px] font-black shadow-md z-30 bg-slate-950 text-amber-300 border border-amber-300 whitespace-nowrap">
+                    {revealedBadge}
                   </span>
                 )}
 

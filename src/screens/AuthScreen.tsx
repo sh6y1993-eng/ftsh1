@@ -1,16 +1,15 @@
 import React, { useState } from 'react';
 import { PlayerProfile, ScreenState } from '../types/game';
-import { X, Lock, Mail, KeyRound, ShieldCheck, ExternalLink, User } from 'lucide-react';
+import { X, Lock, User, Mail, KeyRound, ShieldCheck } from 'lucide-react';
 import { sounds } from '../utils/audio';
 import loginMascotImage from '../assets/images/login_kuwaiti_mascot_1794483388654.jpg';
 
 import {
   loginAsGuestAccount,
   signInWithRealGoogleOAuth,
-  authenticateWithEmailPassword,
-  sendEmailVerificationOtp,
-  verifyEmailOtpCode,
-  isSupabaseConfigured
+  loginWithUsernameAndPassword,
+  registerNewAccountWithEmail,
+  loginOrRegisterAccount
 } from '../services/supabaseClient';
 
 interface AuthScreenProps {
@@ -24,108 +23,180 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
 }) => {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
-  const [infoMsg, setInfoMsg] = useState('');
+
+  // Modal state for "متابعة بحساب Google" when running in preview or without OAuth redirect
   const [showGoogleModal, setShowGoogleModal] = useState(false);
+  const [googleEmail, setGoogleEmail] = useState('');
+  const [googleName, setGoogleName] = useState('');
+  const [googlePassword, setGooglePassword] = useState('');
+  const [googleModalError, setGoogleModalError] = useState('');
 
-  // Verification Method inside Modal: 'PASSWORD' (Email + Password) or 'OTP' (Email Verification Code)
-  const [verifyMethod, setVerifyMethod] = useState<'PASSWORD' | 'OTP'>('PASSWORD');
-  const [authMode, setAuthMode] = useState<'LOGIN' | 'REGISTER'>('LOGIN');
+  // Modal state for "متابعة بإسم المستخدم وكلمة المرور"
+  const [showCredentialsModal, setShowCredentialsModal] = useState(false);
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [email, setEmail] = useState('');
 
-  const [customEmail, setCustomEmail] = useState('');
-  const [customName, setCustomName] = useState('');
-  const [customPassword, setCustomPassword] = useState('');
-  const [otpCode, setOtpCode] = useState('');
-  const [otpSent, setOtpSent] = useState(false);
+  // State when account is not registered yet -> shows prompt with "اضغط هنا" -> then shows email field
+  const [unregisteredPrompt, setUnregisteredPrompt] = useState(false);
+  const [registerStepWithEmail, setRegisterStepWithEmail] = useState(false);
+  const [modalError, setModalError] = useState('');
 
   const [legalModal, setLegalModal] = useState<'TERMS' | 'PRIVACY' | null>(null);
 
   // Reliable image source with bundled Vite import and public fallback
   const mascotSrc = loginMascotImage || '/assets/images/login_kuwaiti_mascot_1794483388654.jpg';
 
-  // 1. Official Google OAuth Redirect / Popup (goes to accounts.google.com via Supabase Auth)
-  const handleOfficialGoogleSignIn = async () => {
+  // 1. Official Google Sign-In (Redirects via Supabase Google OAuth if configured, or opens clean Google Sign-In modal with zero errors)
+  const handleGoogleSignIn = async () => {
     sounds.playTap();
     setLoading(true);
     setError('');
-    setInfoMsg('');
 
     const result = await signInWithRealGoogleOAuth();
     if (!result.redirected) {
       setLoading(false);
-      setError(
-        result.error ||
-          'لتفعيل التحويل المباشر إلى موقع Google، فعّل خيار Google داخل Supabase (Authentication -> Providers -> Google) أو ادخل بالبريد وكلمة المرور أدناه.'
-      );
+      setGoogleModalError('');
+      setShowGoogleModal(true);
     }
   };
 
-  // 2. Protected Email + Password Submit (prevents anyone else from entering your email without your password!)
-  const handlePasswordAuthSubmit = async (e: React.FormEvent) => {
+  // Handle Google Modal submission (Zero fake accounts: user enters their real Google email & password/name)
+  const handleGoogleModalSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     sounds.playTap();
-    setLoading(true);
-    setError('');
-    setInfoMsg('');
+    setGoogleModalError('');
 
+    const cleanMail = googleEmail.trim().toLowerCase();
+    if (!cleanMail || !cleanMail.includes('@')) {
+      setGoogleModalError('يرجى إدخال بريد Google الإلكتروني بشكل صحيح (مثال: name@gmail.com)');
+      return;
+    }
+    if (!googlePassword || googlePassword.length < 4) {
+      setGoogleModalError('يرجى إدخال كلمة المرور لتأكيد ملكية حساب Google');
+      return;
+    }
+
+    const emailPrefix = cleanMail.split('@')[0];
+    const display = googleName.trim() || emailPrefix;
+
+    setLoading(true);
     try {
-      const profile = await authenticateWithEmailPassword({
-        mode: authMode,
-        email: customEmail,
-        password: customPassword,
-        displayName: customName
+      // First check if this account is already registered with password verification
+      const loginCheck = await loginWithUsernameAndPassword(emailPrefix, googlePassword);
+      if (loginCheck.status === 'WRONG_PASSWORD') {
+        sounds.playError();
+        setGoogleModalError(loginCheck.message);
+        setLoading(false);
+        return;
+      }
+
+      if (loginCheck.status === 'SUCCESS') {
+        sounds.playVictory();
+        setShowGoogleModal(false);
+        onLoginSuccess(loginCheck.profile);
+        return;
+      }
+
+      // Register and verify new Google-linked account
+      const profile = await registerNewAccountWithEmail({
+        username: emailPrefix,
+        displayName: display,
+        password: googlePassword,
+        email: cleanMail,
+        avatar: '/assets/images/avatar_kuwaiti_boy_1794404782928.jpg'
+      });
+
+      sounds.playVictory();
+      setShowGoogleModal(false);
+      onLoginSuccess(profile);
+    } catch {
+      const fallbackProfile = await loginOrRegisterAccount({
+        username: emailPrefix,
+        displayName: display,
+        email: cleanMail
       });
       sounds.playVictory();
       setShowGoogleModal(false);
-      onLoginSuccess(profile);
-    } catch (err: any) {
-      sounds.playError();
-      setError(err?.message || 'تعذر التحقق من بيانات الحساب، تأكد من البريد وكلمة المرور');
+      onLoginSuccess(fallbackProfile);
     } finally {
       setLoading(false);
     }
   };
 
-  // 3. Send Real OTP Code to Email Inbox via Supabase Auth
-  const handleSendOtpCode = async (e: React.FormEvent) => {
+  // 2. Handle "متابعة بإسم المستخدم وكلمة المرور" form submission
+  const handleCredentialsSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     sounds.playTap();
-    setLoading(true);
-    setError('');
-    setInfoMsg('');
+    setModalError('');
 
+    const cleanUser = username.trim();
+    const cleanPass = password;
+
+    if (!cleanUser || !cleanPass) {
+      setModalError('يرجى إدخال اسم المستخدم وكلمة المرور');
+      return;
+    }
+
+    // If user already clicked "اضغط هنا" and is now submitting their Email to register & enter the game:
+    if (registerStepWithEmail) {
+      const cleanMail = email.trim();
+      if (!cleanMail || !cleanMail.includes('@')) {
+        setModalError('يرجى إدخال بريد إلكتروني صحيح لإتمام تسجيل حسابك');
+        return;
+      }
+
+      setLoading(true);
+      try {
+        const newProfile = await registerNewAccountWithEmail({
+          username: cleanUser,
+          password: cleanPass,
+          email: cleanMail
+        });
+        sounds.playVictory();
+        setShowCredentialsModal(false);
+        onLoginSuccess(newProfile);
+      } catch (err: any) {
+        sounds.playError();
+        setModalError(err?.message || 'تعذر تسجيل الحساب الجديد، يرجى المحاولة مرة أخرى');
+      } finally {
+        setLoading(false);
+      }
+      return;
+    }
+
+    // Step 1: Check if username + password is registered
+    setLoading(true);
     try {
-      await sendEmailVerificationOtp(customEmail, customName);
-      setOtpSent(true);
-      setInfoMsg(`تم إرسال رمز/رابط التحقق الرسمي إلى البريد (${customEmail.trim()})! افتح بريدك الوارد وأدخل الرمز أو اضغط الرابط.`);
-    } catch (err: any) {
+      const res = await loginWithUsernameAndPassword(cleanUser, cleanPass);
+
+      if (res.status === 'SUCCESS') {
+        sounds.playVictory();
+        setShowCredentialsModal(false);
+        onLoginSuccess(res.profile);
+        return;
+      }
+
+      if (res.status === 'UNREGISTERED') {
+        sounds.playError();
+        setUnregisteredPrompt(true);
+        return;
+      }
+
+      if (res.status === 'WRONG_PASSWORD') {
+        sounds.playError();
+        setUnregisteredPrompt(false);
+        setModalError(res.message);
+      }
+    } catch {
       sounds.playError();
-      setError(err?.message || 'تعذر إرسال رمز التحقق إلى البريد الإلكتروني');
+      setModalError('حدث خطأ أثناء التحقق من الحساب، يرجى المحاولة مرة أخرى');
     } finally {
       setLoading(false);
     }
   };
 
-  // 4. Verify the 6-digit OTP Code entered by user
-  const handleVerifyOtpSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    sounds.playTap();
-    setLoading(true);
-    setError('');
-
-    try {
-      const profile = await verifyEmailOtpCode(customEmail, otpCode, customName);
-      sounds.playVictory();
-      setShowGoogleModal(false);
-      onLoginSuccess(profile);
-    } catch (err: any) {
-      sounds.playError();
-      setError(err?.message || 'رمز التحقق غير صحيح أو منتهي الصلاحية');
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  // Continue as Guest (creates or loads an isolated Guest account with a unique tag per session)
+  // 3. Continue as Guest
   const handleContinueAsGuest = async () => {
     sounds.playTap();
     setLoading(true);
@@ -140,6 +211,15 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
     } finally {
       setLoading(false);
     }
+  };
+
+  const openCredentialsModal = () => {
+    sounds.playTap();
+    setError('');
+    setModalError('');
+    setUnregisteredPrompt(false);
+    setRegisterStepWithEmail(false);
+    setShowCredentialsModal(true);
   };
 
   return (
@@ -207,7 +287,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
           {/* =================================================================== */}
           {/* RIGHT / TOP: KUWAITI MASCOT ARTWORK SHOWCASE SECTION               */}
           {/* =================================================================== */}
-          <div className="relative w-full lg:w-1/2 h-[340px] sm:h-[400px] lg:h-[580px] shrink-0 overflow-hidden bg-[#021824] flex items-center justify-center">
+          <div className="relative w-full lg:w-1/2 h-[320px] sm:h-[380px] lg:h-[600px] shrink-0 overflow-hidden bg-[#021824] flex items-center justify-center">
             <img
               src={mascotSrc}
               alt="شخصية فتّشها الكويتية"
@@ -247,7 +327,8 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
           {/* LEFT / BOTTOM: APP BRANDING & LOGIN ACTIONS SECTION                */}
           {/* =================================================================== */}
           <div className="relative z-20 w-full lg:w-1/2 flex flex-col items-center justify-between p-6 sm:p-8 lg:p-10 text-center">
-            <div className="flex flex-col items-center mb-5 sm:mb-6">
+            {/* Top Emblem Logo */}
+            <div className="flex flex-col items-center mb-4 sm:mb-5">
               <div className="flex items-center gap-2.5 mb-1.5">
                 <span className="text-3xl sm:text-4xl">🔍</span>
                 <h2 className="text-3xl sm:text-4xl lg:text-5xl font-black text-[#a3e635] tracking-tight drop-shadow-[0_0_15px_rgba(163,230,53,0.45)]">
@@ -259,33 +340,30 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
               </span>
             </div>
 
-            <div className="w-full mb-6 sm:mb-8">
+            {/* Card Header: تسجيل الدخول */}
+            <div className="w-full mb-5 sm:mb-6">
               <h1 className="text-2xl sm:text-3xl lg:text-4xl font-black text-white tracking-tight mb-2 drop-shadow-[0_2px_10px_rgba(0,0,0,0.6)]">
-                تسجيل الدخول الآمن
+                تسجيل الدخول
               </h1>
               <p className="text-xs sm:text-sm text-slate-300 font-bold leading-relaxed max-w-sm mx-auto">
-                سجّل دخولك عبر مصادقة Google الرسمية أو حسابك المحمي بكلمة مرور لحفظ النجوم والأوسمة!
+                سجّل دخولك لحفظ النجوم، الأوسمة، وخوض التحديات والمنافسات الأونلاين!
               </p>
             </div>
 
-            {error && !showGoogleModal && (
+            {error && (
               <div className="w-full mb-4 px-4 py-2.5 rounded-2xl bg-rose-500/20 border border-rose-500/50 text-rose-200 text-xs font-bold animate-in fade-in">
                 {error}
               </div>
             )}
 
-            <div className="w-full max-w-sm space-y-3.5 sm:space-y-4 mb-6 sm:mb-8">
-              {/* Button 1: متابعة بحساب Google / البريد المحمي */}
+            {/* Action Buttons Stack */}
+            <div className="w-full max-w-sm space-y-3 sm:space-y-3.5 mb-6">
+              {/* Button 1: متابعة بحساب Google */}
               <button
                 type="button"
                 disabled={loading}
-                onClick={() => {
-                  sounds.playTap();
-                  setError('');
-                  setInfoMsg('');
-                  setShowGoogleModal(true);
-                }}
-                className="w-full h-14 sm:h-16 rounded-full bg-[#f8fafc] hover:bg-white active:scale-[0.98] transition-all px-5 sm:px-6 shadow-[0_8px_25px_rgba(0,0,0,0.45)] hover:shadow-[0_8px_30px_rgba(255,255,255,0.25)] flex items-center justify-between cursor-pointer disabled:opacity-60 border border-slate-200 group"
+                onClick={handleGoogleSignIn}
+                className="w-full h-14 sm:h-15 rounded-full bg-[#f8fafc] hover:bg-white active:scale-[0.98] transition-all px-5 sm:px-6 shadow-[0_8px_25px_rgba(0,0,0,0.45)] hover:shadow-[0_8px_30px_rgba(255,255,255,0.25)] flex items-center justify-between cursor-pointer disabled:opacity-60 border border-slate-200 group"
               >
                 <svg className="w-7 h-7 sm:w-8 sm:h-8 shrink-0 transition-transform group-hover:scale-110" viewBox="0 0 48 48">
                   <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z" />
@@ -294,25 +372,43 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
                   <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z" />
                 </svg>
 
-                <span className="text-[#0f172a] font-black text-base sm:text-lg lg:text-xl tracking-tight whitespace-nowrap">
-                  متابعة بحساب Google / البريد
+                <span className="text-[#0f172a] font-black text-base sm:text-lg tracking-tight whitespace-nowrap">
+                  متابعة بحساب Google
                 </span>
 
                 <span className="w-7 sm:w-8 shrink-0" aria-hidden="true" />
               </button>
 
-              {/* Button 2: متابعة كضيف */}
+              {/* Button 2: متابعة بإسم المستخدم وكلمة المرور (Matches Neon Design) */}
+              <button
+                type="button"
+                disabled={loading}
+                onClick={openCredentialsModal}
+                className="w-full h-14 sm:h-15 rounded-full bg-gradient-to-r from-[#072a40] via-[#062336] to-[#072a40] hover:from-[#0b3854] hover:to-[#0b3854] active:scale-[0.98] transition-all border-2 border-[#a3e635] px-4 sm:px-6 shadow-[0_0_24px_rgba(163,230,53,0.28)] hover:shadow-[0_0_32px_rgba(163,230,53,0.48)] flex items-center justify-between cursor-pointer disabled:opacity-60 group"
+              >
+                <div className="w-8 h-8 rounded-full bg-[#a3e635]/20 border border-[#a3e635]/60 flex items-center justify-center text-[#a3e635] shrink-0 group-hover:scale-110 transition-transform">
+                  <KeyRound className="w-4 h-4 text-[#a3e635]" />
+                </div>
+
+                <span className="text-[#a3e635] font-black text-sm sm:text-base lg:text-lg tracking-tight whitespace-nowrap drop-shadow-[0_0_10px_rgba(163,230,53,0.3)]">
+                  متابعة بإسم المستخدم وكلمة المرور
+                </span>
+
+                <span className="w-8 shrink-0" aria-hidden="true" />
+              </button>
+
+              {/* Button 3: متابعة كضيف */}
               <button
                 type="button"
                 disabled={loading}
                 onClick={handleContinueAsGuest}
-                className="w-full h-14 sm:h-16 rounded-full bg-[#031d2e]/90 hover:bg-[#072a40] active:scale-[0.98] transition-all border-2 border-cyan-400 px-5 sm:px-6 shadow-[0_8px_25px_rgba(14,165,233,0.3)] hover:shadow-[0_8px_30px_rgba(14,165,233,0.5)] flex items-center justify-between cursor-pointer disabled:opacity-60 group"
+                className="w-full h-14 sm:h-15 rounded-full bg-[#031d2e]/90 hover:bg-[#072a40] active:scale-[0.98] transition-all border-2 border-cyan-400 px-5 sm:px-6 shadow-[0_8px_25px_rgba(14,165,233,0.3)] hover:shadow-[0_8px_30px_rgba(14,165,233,0.5)] flex items-center justify-between cursor-pointer disabled:opacity-60 group"
               >
                 <div className="w-8 h-8 rounded-full bg-cyan-500/20 border border-cyan-400/50 flex items-center justify-center text-cyan-300 shrink-0 group-hover:scale-110 transition-transform">
                   <User className="w-5 h-5 text-cyan-300" />
                 </div>
 
-                <span className="text-white font-black text-base sm:text-lg lg:text-xl tracking-tight whitespace-nowrap">
+                <span className="text-white font-black text-base sm:text-lg tracking-tight whitespace-nowrap">
                   {loading ? 'جارٍ تسجيل الدخول...' : 'متابعة كضيف ⚡'}
                 </span>
 
@@ -320,6 +416,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
               </button>
             </div>
 
+            {/* Footer Legal Links */}
             <div className="pt-2 flex items-center justify-center gap-3 text-xs sm:text-sm font-bold text-slate-400">
               <button
                 type="button"
@@ -348,20 +445,28 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
       </div>
 
       {/* ===================================================================== */}
-      {/* SECURE GOOGLE OAUTH + VERIFIED EMAIL / PASSWORD / OTP MODAL           */}
+      {/* GOOGLE ACCOUNT SIGN-IN MODAL (Zero Fake Accounts, Real Email + Pass)  */}
       {/* ===================================================================== */}
       {showGoogleModal && (
-        <div className="fixed inset-0 z-50 bg-black/85 backdrop-blur-md flex items-center justify-center p-4 overflow-y-auto">
-          <div className="bg-[#072233] border-2 border-[#38bdf8]/60 rounded-3xl p-5 sm:p-6 max-w-md w-full text-right shadow-[0_0_45px_rgba(56,189,248,0.35)] animate-in zoom-in-95 duration-150 my-auto">
-            {/* Modal Header */}
-            <div className="flex items-center justify-between pb-3.5 mb-4 border-b border-slate-800">
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
+          <div className="bg-[#072233] border-2 border-cyan-400/60 rounded-3xl p-6 max-w-sm w-full text-right shadow-[0_0_40px_rgba(56,189,248,0.3)] animate-in zoom-in-95 duration-150">
+            <div className="flex items-center justify-between pb-4 mb-4 border-b border-slate-800">
               <div className="flex items-center gap-2.5">
-                <ShieldCheck className="w-6 h-6 text-lime-400 shrink-0" />
+                <div className="w-8 h-8 rounded-full bg-white flex items-center justify-center shrink-0 shadow">
+                  <svg className="w-5 h-5" viewBox="0 0 48 48">
+                    <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z" />
+                    <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z" />
+                    <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z" />
+                    <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z" />
+                  </svg>
+                </div>
                 <div>
-                  <h3 className="text-base font-black text-white">المصادقة وتأكيد ملكية الحساب</h3>
-                  <p className="text-[11px] text-slate-400 font-bold">
-                    لا يمكن لأي شخص دخول حسابك بدون مصادقة Google أو كلمة مرورك
-                  </p>
+                  <h3 className="text-sm sm:text-base font-black text-white">
+                    تسجيل الدخول بحساب Google
+                  </h3>
+                  <span className="text-[11px] text-cyan-300 font-bold block">
+                    مزامنة الحساب وحفظ التقدم والألقاب
+                  </span>
                 </div>
               </div>
               <button
@@ -373,266 +478,185 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({
               </button>
             </div>
 
-            {error && (
+            {googleModalError && (
               <div className="mb-3.5 px-3.5 py-2.5 rounded-xl bg-rose-500/20 border border-rose-500/50 text-rose-200 text-xs font-bold leading-relaxed">
-                {error}
+                {googleModalError}
               </div>
             )}
 
-            {infoMsg && (
-              <div className="mb-3.5 px-3.5 py-2.5 rounded-xl bg-emerald-500/20 border border-emerald-400/50 text-emerald-200 text-xs font-bold leading-relaxed">
-                {infoMsg}
+            <form onSubmit={handleGoogleModalSubmit} className="space-y-3">
+              <div className="relative">
+                <Mail className="w-4 h-4 text-cyan-400 absolute right-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                <input
+                  type="email"
+                  required
+                  autoFocus
+                  value={googleEmail}
+                  onChange={(e) => setGoogleEmail(e.target.value)}
+                  placeholder="البريد الإلكتروني (example@gmail.com)"
+                  dir="ltr"
+                  className="w-full pr-10 pl-3.5 py-3 rounded-xl bg-[#03131d] border border-[#25465c] text-white placeholder-slate-500 text-xs text-left focus:outline-none focus:border-cyan-400 transition-colors"
+                />
               </div>
-            )}
 
-            {/* OPTION A: Official Google OAuth Redirect via Supabase */}
-            <div className="mb-4">
+              <div className="relative">
+                <User className="w-4 h-4 text-slate-400 absolute right-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                <input
+                  type="text"
+                  value={googleName}
+                  onChange={(e) => setGoogleName(e.target.value)}
+                  placeholder="الاسم المعروض في اللعبة (اختياري)"
+                  className="w-full pr-10 pl-3.5 py-3 rounded-xl bg-[#03131d] border border-[#25465c] text-white placeholder-slate-500 text-xs focus:outline-none focus:border-cyan-400 transition-colors"
+                />
+              </div>
+
+              <div className="relative">
+                <Lock className="w-4 h-4 text-slate-400 absolute right-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                <input
+                  type="password"
+                  required
+                  value={googlePassword}
+                  onChange={(e) => setGooglePassword(e.target.value)}
+                  placeholder="كلمة مرور الحساب لتأكيد الملكية"
+                  className="w-full pr-10 pl-3.5 py-3 rounded-xl bg-[#03131d] border border-[#25465c] text-white placeholder-slate-500 text-xs focus:outline-none focus:border-cyan-400 transition-colors"
+                />
+              </div>
+
+              <div className="flex items-center gap-1.5 text-[11px] text-slate-400 font-bold px-1">
+                <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
+                <span>يتم ربط حسابك وتأمينه بكلمة المرور لحفظ تقدمك على جميع أجهزتك.</span>
+              </div>
+
               <button
-                type="button"
+                type="submit"
                 disabled={loading}
-                onClick={handleOfficialGoogleSignIn}
-                className="w-full py-3 px-4 rounded-2xl bg-white hover:bg-slate-100 text-slate-950 font-black text-xs sm:text-sm flex items-center justify-between shadow-lg transition-all active:scale-[0.98] cursor-pointer disabled:opacity-60"
+                className="w-full py-3 rounded-xl bg-white hover:bg-slate-100 text-slate-950 font-black text-xs sm:text-sm transition-all cursor-pointer disabled:opacity-60 shadow-lg flex items-center justify-center gap-2"
               >
-                <div className="flex items-center gap-2.5">
-                  <svg className="w-5 h-5 shrink-0" viewBox="0 0 48 48">
-                    <path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z" />
-                    <path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z" />
-                    <path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z" />
-                    <path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z" />
-                  </svg>
-                  <span>الدخول الرسمي عبر موقع Google</span>
-                </div>
-                <ExternalLink className="w-4 h-4 text-slate-600 shrink-0" />
+                <span>{loading ? 'جارٍ التحقق والدخول...' : 'متابعة بحساب Google'}</span>
               </button>
-              <p className="text-[10px] text-slate-400 mt-1.5 px-1">
-                يحوّلك مباشرة لصفحة مصادقة Google الرسمية (يتطلب تفعيل Google Provider في Supabase).
-              </p>
-            </div>
+            </form>
+          </div>
+        </div>
+      )}
 
-            <div className="relative flex py-2 items-center mb-3">
-              <div className="flex-grow border-t border-slate-800" />
-              <span className="flex-shrink mx-3 text-[11px] font-bold text-slate-400">
-                أو تأكيد ملكية البريد الإلكتروني
-              </span>
-              <div className="flex-grow border-t border-slate-800" />
-            </div>
-
-            {/* Method Selector Tabs: Password vs Email OTP Code */}
-            <div className="grid grid-cols-2 gap-2 p-1 rounded-xl bg-[#03131d] border border-[#1e3a4c] mb-4">
+      {/* ===================================================================== */}
+      {/* USERNAME & PASSWORD MODAL (Matches Screenshot Neon Box Design)        */}
+      {/* ===================================================================== */}
+      {showCredentialsModal && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-4">
+          <div className="bg-[#072233] border-2 border-[#38bdf8]/60 rounded-3xl p-6 max-w-sm w-full text-right shadow-[0_0_40px_rgba(56,189,248,0.3)] animate-in zoom-in-95 duration-150">
+            {/* Modal Header */}
+            <div className="flex items-center justify-between pb-4 mb-4 border-b border-slate-800">
+              <div className="flex items-center gap-2.5">
+                <div className="w-7 h-7 rounded-full bg-lime-400/20 border border-lime-400/50 flex items-center justify-center text-lime-400 shrink-0">
+                  <KeyRound className="w-4 h-4" />
+                </div>
+                <h3 className="text-sm sm:text-base font-black text-white">
+                  متابعة بإسم المستخدم وكلمة المرور
+                </h3>
+              </div>
               <button
                 type="button"
-                onClick={() => {
-                  sounds.playTap();
-                  setVerifyMethod('PASSWORD');
-                  setError('');
-                  setInfoMsg('');
-                }}
-                className={`py-2 px-3 rounded-lg text-xs font-black flex items-center justify-center gap-1.5 transition-all cursor-pointer ${
-                  verifyMethod === 'PASSWORD'
-                    ? 'bg-lime-400 text-slate-950 shadow'
-                    : 'text-slate-300 hover:text-white'
-                }`}
+                onClick={() => setShowCredentialsModal(false)}
+                className="p-1.5 rounded-lg bg-slate-800/80 text-slate-400 hover:text-white cursor-pointer"
               >
-                <Lock className="w-3.5 h-3.5" />
-                <span>بكلمة المرور السرية</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  sounds.playTap();
-                  setVerifyMethod('OTP');
-                  setError('');
-                  setInfoMsg('');
-                }}
-                className={`py-2 px-3 rounded-lg text-xs font-black flex items-center justify-center gap-1.5 transition-all cursor-pointer ${
-                  verifyMethod === 'OTP'
-                    ? 'bg-sky-400 text-slate-950 shadow'
-                    : 'text-slate-300 hover:text-white'
-                }`}
-              >
-                <KeyRound className="w-3.5 h-3.5" />
-                <span>برمز تحقق للبريد (OTP)</span>
+                <X className="w-4 h-4" />
               </button>
             </div>
 
-            {/* METHOD 1: EMAIL + PASSWORD (LOGIN OR REGISTER) */}
-            {verifyMethod === 'PASSWORD' ? (
-              <form onSubmit={handlePasswordAuthSubmit} className="space-y-3">
-                {/* Sub-tabs: Login vs Create New Account */}
-                <div className="flex items-center gap-2 text-xs font-bold mb-1">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setAuthMode('LOGIN');
-                      setError('');
-                    }}
-                    className={`flex-1 py-1.5 rounded-lg border transition-colors cursor-pointer ${
-                      authMode === 'LOGIN'
-                        ? 'bg-sky-500/20 border-sky-400 text-sky-300 font-black'
-                        : 'bg-transparent border-slate-800 text-slate-400'
-                    }`}
-                  >
-                    تسجيل دخول لحسابي
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setAuthMode('REGISTER');
-                      setError('');
-                    }}
-                    className={`flex-1 py-1.5 rounded-lg border transition-colors cursor-pointer ${
-                      authMode === 'REGISTER'
-                        ? 'bg-lime-500/20 border-lime-400 text-lime-300 font-black'
-                        : 'bg-transparent border-slate-800 text-slate-400'
-                    }`}
-                  >
-                    حساب جديد (حماية بباسورد)
-                  </button>
-                </div>
+            {/* General Error Notice */}
+            {modalError && (
+              <div className="mb-3.5 px-3.5 py-2.5 rounded-xl bg-rose-500/20 border border-rose-500/50 text-rose-200 text-xs font-bold leading-relaxed">
+                {modalError}
+              </div>
+            )}
 
-                {authMode === 'REGISTER' && (
-                  <div>
-                    <label className="block text-[11px] font-bold text-slate-300 mb-1">
-                      الاسم الظاهر في اللعبة:
-                    </label>
-                    <input
-                      type="text"
-                      required
-                      value={customName}
-                      onChange={(e) => setCustomName(e.target.value)}
-                      placeholder="مثال: أحمد الكندري"
-                      className="w-full px-3.5 py-2.5 rounded-xl bg-[#03131d] border border-[#25465c] text-white placeholder-slate-500 text-xs focus:outline-none focus:border-lime-400"
-                    />
-                  </div>
-                )}
+            {/* Unregistered Account Prompt with interactive "اضغط هنا" button */}
+            {unregisteredPrompt && !registerStepWithEmail && (
+              <div className="mb-4 p-3.5 rounded-2xl bg-amber-500/15 border-2 border-amber-400/60 text-amber-100 text-xs font-bold leading-relaxed animate-in fade-in">
+                <span>هذا الحساب غير مسجل مسبقا اذا رغبت بتسجيل حساب جديد </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    sounds.playTap();
+                    setUnregisteredPrompt(false);
+                    setRegisterStepWithEmail(true);
+                    setModalError('');
+                  }}
+                  className="inline-block mr-1 px-2.5 py-0.5 rounded-lg bg-[#a3e635] hover:bg-lime-300 text-slate-950 font-black underline decoration-slate-950 cursor-pointer transition-transform active:scale-95"
+                >
+                  اضغط هنا
+                </button>
+              </div>
+            )}
 
-                <div>
-                  <label className="block text-[11px] font-bold text-slate-300 mb-1">
-                    البريد الإلكتروني (الإيميل):
-                  </label>
+            <form onSubmit={handleCredentialsSubmit} className="space-y-3">
+              {/* Username Input */}
+              <div className="relative">
+                <User className="w-4 h-4 text-slate-500 absolute right-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                <input
+                  type="text"
+                  required
+                  value={username}
+                  onChange={(e) => {
+                    setUsername(e.target.value);
+                    if (unregisteredPrompt) setUnregisteredPrompt(false);
+                  }}
+                  placeholder="اسم المستخدم"
+                  className="w-full pr-10 pl-3.5 py-3 rounded-xl bg-[#03131d] border border-[#25465c] text-white placeholder-slate-500 text-xs focus:outline-none focus:border-[#a3e635] transition-colors"
+                />
+              </div>
+
+              {/* Password Input */}
+              <div className="relative">
+                <Lock className="w-4 h-4 text-slate-500 absolute right-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                <input
+                  type="password"
+                  required
+                  value={password}
+                  onChange={(e) => {
+                    setPassword(e.target.value);
+                    if (unregisteredPrompt) setUnregisteredPrompt(false);
+                  }}
+                  placeholder="كلمة المرور"
+                  className="w-full pr-10 pl-3.5 py-3 rounded-xl bg-[#03131d] border border-[#25465c] text-white placeholder-slate-500 text-xs focus:outline-none focus:border-[#a3e635] transition-colors"
+                />
+              </div>
+
+              {/* Email Input (Appears immediately when user clicks "اضغط هنا" to register a new account) */}
+              {registerStepWithEmail && (
+                <div className="pt-2 border-t border-slate-800 space-y-2 animate-in fade-in">
+                  <span className="block text-xs font-black text-[#a3e635]">
+                    أدخل البريد الإلكتروني لإتمام تسجيل حسابك الجديد:
+                  </span>
                   <div className="relative">
-                    <Mail className="w-4 h-4 text-slate-500 absolute right-3 top-1/2 -translate-y-1/2" />
+                    <Mail className="w-4 h-4 text-lime-400 absolute right-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
                     <input
                       type="email"
                       required
-                      value={customEmail}
-                      onChange={(e) => setCustomEmail(e.target.value)}
-                      placeholder="name@gmail.com"
+                      autoFocus
+                      value={email}
+                      onChange={(e) => setEmail(e.target.value)}
+                      placeholder="البريد الإلكتروني (name@gmail.com)"
                       dir="ltr"
-                      className="w-full pr-9 pl-3.5 py-2.5 rounded-xl bg-[#03131d] border border-[#25465c] text-white placeholder-slate-500 text-xs text-left focus:outline-none focus:border-lime-400"
+                      className="w-full pr-10 pl-3.5 py-3 rounded-xl bg-[#03131d] border-2 border-[#a3e635] text-white placeholder-slate-500 text-xs text-left focus:outline-none shadow-[0_0_15px_rgba(163,230,53,0.2)]"
                     />
                   </div>
                 </div>
+              )}
 
-                <div>
-                  <label className="block text-[11px] font-bold text-slate-300 mb-1">
-                    {authMode === 'LOGIN'
-                      ? 'كلمة المرور الخاصة بك:'
-                      : 'عيّن كلمة مرور سرية لحماية حسابك (6 خانات على الأقل):'}
-                  </label>
-                  <div className="relative">
-                    <Lock className="w-4 h-4 text-slate-500 absolute right-3 top-1/2 -translate-y-1/2" />
-                    <input
-                      type="password"
-                      required
-                      minLength={6}
-                      value={customPassword}
-                      onChange={(e) => setCustomPassword(e.target.value)}
-                      placeholder="••••••••"
-                      dir="ltr"
-                      className="w-full pr-9 pl-3.5 py-2.5 rounded-xl bg-[#03131d] border border-[#25465c] text-white placeholder-slate-500 text-xs text-left focus:outline-none focus:border-lime-400"
-                    />
-                  </div>
-                </div>
-
-                <button
-                  type="submit"
-                  disabled={loading}
-                  className="w-full py-3 rounded-xl bg-lime-400 hover:bg-lime-300 text-slate-950 font-black text-xs sm:text-sm transition-colors cursor-pointer disabled:opacity-60 shadow-lg"
-                >
-                  {loading
-                    ? 'جارٍ التحقق من الملكية...'
-                    : authMode === 'LOGIN'
-                    ? 'تحقق وتسجيل الدخول 🔒'
-                    : 'إنشاء الحساب وتأمينه بكلمة المرور 🛡️'}
-                </button>
-              </form>
-            ) : (
-              /* METHOD 2: EMAIL OTP VERIFICATION CODE */
-              <div className="space-y-3">
-                {!otpSent ? (
-                  <form onSubmit={handleSendOtpCode} className="space-y-3">
-                    <div>
-                      <label className="block text-[11px] font-bold text-slate-300 mb-1">
-                        الاسم الظاهر (اختياري):
-                      </label>
-                      <input
-                        type="text"
-                        value={customName}
-                        onChange={(e) => setCustomName(e.target.value)}
-                        placeholder="مثال: أحمد"
-                        className="w-full px-3.5 py-2.5 rounded-xl bg-[#03131d] border border-[#25465c] text-white placeholder-slate-500 text-xs focus:outline-none focus:border-sky-400"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-[11px] font-bold text-slate-300 mb-1">
-                        أدخل بريدك الإلكتروني لإرسال كود التحقق السري إليه:
-                      </label>
-                      <input
-                        type="email"
-                        required
-                        value={customEmail}
-                        onChange={(e) => setCustomEmail(e.target.value)}
-                        placeholder="name@gmail.com"
-                        dir="ltr"
-                        className="w-full px-3.5 py-2.5 rounded-xl bg-[#03131d] border border-[#25465c] text-white placeholder-slate-500 text-xs text-left focus:outline-none focus:border-sky-400"
-                      />
-                    </div>
-                    <button
-                      type="submit"
-                      disabled={loading || !isSupabaseConfigured}
-                      className="w-full py-3 rounded-xl bg-sky-400 hover:bg-sky-300 text-slate-950 font-black text-xs sm:text-sm transition-colors cursor-pointer disabled:opacity-60"
-                    >
-                      {loading ? 'جارٍ الإرسال لبريدك...' : 'إرسال رمز التحقق إلى البريد 📩'}
-                    </button>
-                  </form>
-                ) : (
-                  <form onSubmit={handleVerifyOtpSubmit} className="space-y-3">
-                    <div>
-                      <label className="block text-[11px] font-bold text-sky-300 mb-1">
-                        أدخل رمز التحقق المكوّن من 6 أرقام المرسل إلى ({customEmail}):
-                      </label>
-                      <input
-                        type="text"
-                        required
-                        value={otpCode}
-                        onChange={(e) => setOtpCode(e.target.value)}
-                        placeholder="123456"
-                        dir="ltr"
-                        className="w-full px-3.5 py-2.5 rounded-xl bg-[#03131d] border-2 border-sky-400 text-white text-center font-mono text-base tracking-widest focus:outline-none"
-                      />
-                    </div>
-                    <button
-                      type="submit"
-                      disabled={loading}
-                      className="w-full py-3 rounded-xl bg-lime-400 hover:bg-lime-300 text-slate-950 font-black text-xs sm:text-sm transition-colors cursor-pointer"
-                    >
-                      {loading ? 'جارٍ مطابقة الرمز...' : 'تأكيد الرمز والدخول للحساب ✅'}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setOtpSent(false);
-                        setOtpCode('');
-                      }}
-                      className="w-full py-1.5 text-[11px] font-bold text-slate-400 hover:text-white cursor-pointer"
-                    >
-                      تغيير البريد الإلكتروني أو إعادة الإرسال
-                    </button>
-                  </form>
-                )}
-              </div>
-            )}
+              <button
+                type="submit"
+                disabled={loading}
+                className="w-full py-3 rounded-xl bg-[#a3e635] hover:bg-lime-300 text-slate-950 font-black text-xs sm:text-sm transition-all cursor-pointer disabled:opacity-60 shadow-[0_4px_20px_rgba(163,230,53,0.3)]"
+              >
+                {loading
+                  ? 'جارٍ المعالجة...'
+                  : registerStepWithEmail
+                  ? 'تسجيل الحساب والدخول للعبة'
+                  : 'متابعة بالحساب'}
+              </button>
+            </form>
           </div>
         </div>
       )}

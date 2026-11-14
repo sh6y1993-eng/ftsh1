@@ -1,6 +1,6 @@
 import React from 'react';
 import { Category, PlayerProfile, ScreenState } from '../types/game';
-import { CATEGORIES } from '../engine/gameCategories';
+import { CATEGORIES, PREMIUM_CATEGORIES } from '../engine/gameCategories';
 import { sounds } from '../utils/audio';
 
 interface CategoryScreenProps {
@@ -597,6 +597,42 @@ export const CategoryScreen: React.FC<CategoryScreenProps> = ({
             );
           })}
         </div>
+
+        {/* Unlocked Premium Challenge Categories from the Store */}
+        {PREMIUM_CATEGORIES.some(pc => (user?.unlockedCategories || []).includes(pc.id)) && (
+          <div className="relative z-20 w-full max-w-5xl xl:max-w-6xl mx-auto px-4 sm:px-8 pb-8">
+            <h3 className="text-sm sm:text-base font-black text-amber-300 mb-3 flex items-center gap-2">
+              <span>👑 تصنيفاتك الحصرية المفتوحة من المتجر:</span>
+            </h3>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+              {PREMIUM_CATEGORIES.filter(pc => (user?.unlockedCategories || []).includes(pc.id)).map(pc => {
+                const stats = getCategoryStats(pc.id);
+                return (
+                  <button
+                    key={pc.id}
+                    type="button"
+                    onClick={() => {
+                      sounds.playTap();
+                      onSelectCategory(pc);
+                    }}
+                    className="rounded-3xl p-4 flex items-center justify-between gap-3 border-2 border-amber-400/70 bg-gradient-to-l from-[#1a2942] to-[#081b2c] hover:brightness-110 transition-all cursor-pointer text-right shadow-xl"
+                  >
+                    <div>
+                      <div className="text-base font-black text-white">{pc.name}</div>
+                      <div className="text-xs text-slate-300 font-bold mt-0.5">{pc.description}</div>
+                      <div className="text-xs font-black text-amber-300 mt-1 tabular-nums">
+                        {stats.completed} / 50 مرحلة • ★ {stats.stars}
+                      </div>
+                    </div>
+                    <span className="px-3 py-1.5 rounded-xl bg-amber-400 text-slate-950 font-black text-xs shrink-0">
+                      العب الآن
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

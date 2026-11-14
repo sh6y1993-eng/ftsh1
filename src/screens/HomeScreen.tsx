@@ -1,9 +1,11 @@
 import React, { useState } from 'react';
 import { PlayerProfile, ScreenState, FriendProfileSummary } from '../types/game';
-import { Bell, Plus, X, Coins, Lightbulb, Sparkles, BarChart3, Flame, Check, Users, UserPlus } from 'lucide-react';
+import { Bell, Plus, X, Sparkles, Flame, Users, UserPlus } from 'lucide-react';
 import { DailyChallengesModal } from '../components/DailyChallengesModal';
 import { DailyStreakModal } from '../components/DailyStreakModal';
 import { FriendsModal } from '../components/FriendsModal';
+import { StoreModal } from '../components/StoreModal';
+import { getNameGlowClass } from '../engine/gameCategories';
 import { sounds } from '../utils/audio';
 
 interface HomeScreenProps {
@@ -23,7 +25,6 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   onInviteFriendToNewPrivateRoom
 }) => {
   const [activeModal, setActiveModal] = useState<'STORE' | 'MISSIONS' | 'NOTIFICATIONS' | 'STREAK' | 'FRIENDS' | null>(null);
-  const [storeNotice, setStoreNotice] = useState('');
 
   const displayName = user?.displayName?.split(' ')[0] || 'لاعب';
   const displayLevel = user?.level ?? 1;
@@ -40,37 +41,6 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   const completedToday = user?.dailyStreak?.completedToday ?? false;
   const todayBonusCoins = user?.dailyStreak?.todayBonusCoins ?? 0;
   const nextBonusCoins = user?.dailyStreak?.nextBonusCoins ?? (50 + Math.min(currentStreak + 1, 14) * 20);
-
-  const handleBuyHintPack = async (hintsAmount: number, cost: number) => {
-    sounds.playTap();
-    if (!user) {
-      setStoreNotice('يرجى تسجيل الدخول أولاً لشراء التلميحات');
-      return;
-    }
-
-    try {
-      const res = await fetch('/api/hints/buy', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: user.username, amount: hintsAmount, cost })
-      });
-      const data = await res.json();
-      if (data.success && onUpdateUser) {
-        sounds.playVictory();
-        onUpdateUser({
-          ...user,
-          coins: data.coins,
-          hintsRemaining: data.hintsRemaining
-        });
-        setStoreNotice(`كفو! تمت إضافة ${hintsAmount} تلميحات إلى رصيدك 💡`);
-      } else {
-        sounds.playError();
-        setStoreNotice(data.error || 'العملات غير كافية لشراء هذه الباقة');
-      }
-    } catch {
-      setStoreNotice('تعذر الاتصال بالخادم حالياً');
-    }
-  };
 
   const dailyTasks = user?.dailyChallenges?.tasks || [
     {
@@ -331,9 +301,10 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                   sounds.playTap();
                   onNavigate('PROFILE');
                 }}
-                className="text-[#38bdf8] hover:text-sky-300 text-base sm:text-lg font-black tracking-tight cursor-pointer"
+                className={`text-base sm:text-lg font-black tracking-tight cursor-pointer flex items-center gap-1 ${getNameGlowClass(user?.equippedNameGlow)}`}
               >
-                {displayName}
+                <span>{displayName}</span>
+                {user?.isVip && <span className="text-xs">👑</span>}
               </button>
               <span className="text-slate-300 font-mono text-xs tabular-nums">
                 {currentXP} / {targetXP}
@@ -697,79 +668,15 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
         </nav>
       </div>
 
-      {/* Store Modal (المتجر) */}
-      {activeModal === 'STORE' && (
-        <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-[#072233] border border-[#2d5b75] rounded-3xl p-6 max-w-sm w-full text-right shadow-2xl animate-in zoom-in-95 duration-150">
-            <div className="flex items-center justify-between pb-3 mb-4 border-b border-slate-800">
-              <h3 className="text-lg font-black text-white flex items-center gap-2">
-                <Lightbulb className="w-5 h-5 text-amber-400" />
-                <span>متجر فتّشها</span>
-              </h3>
-              <button
-                type="button"
-                onClick={() => {
-                  setActiveModal(null);
-                  setStoreNotice('');
-                }}
-                className="p-1.5 rounded-lg bg-slate-800 text-slate-400 hover:text-white"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            {storeNotice && (
-              <div className="mb-4 p-3 rounded-xl bg-lime-500/15 border border-lime-400/40 text-lime-300 text-xs font-bold text-center">
-                {storeNotice}
-              </div>
-            )}
-
-            <div className="space-y-3 mb-5">
-              <div className="p-3.5 rounded-2xl bg-[#041622] border border-[#25465c] flex items-center justify-between">
-                <div>
-                  <div className="text-sm font-black text-white">باقة 3 تلميحات ذكية</div>
-                  <div className="text-xs text-slate-400">مساعدة سريعة أثناء اللعب</div>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => handleBuyHintPack(3, 50)}
-                  className="px-4 py-2 rounded-xl bg-amber-400 hover:bg-amber-300 text-slate-950 font-black text-xs flex items-center gap-1.5 tabular-nums"
-                >
-                  <Coins className="w-3.5 h-3.5" />
-                  <span>50</span>
-                </button>
-              </div>
-
-              <div className="p-3.5 rounded-2xl bg-[#041622] border border-lime-400/40 flex items-center justify-between">
-                <div>
-                  <div className="text-sm font-black text-lime-400">باقة 8 تلميحات (الأوفر)</div>
-                  <div className="text-xs text-slate-400">للمراحل المتقدمة 12×12</div>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => handleBuyHintPack(8, 120)}
-                  className="px-4 py-2 rounded-xl bg-lime-400 hover:bg-lime-300 text-slate-950 font-black text-xs flex items-center gap-1.5 tabular-nums"
-                >
-                  <Coins className="w-3.5 h-3.5" />
-                  <span>120</span>
-                </button>
-              </div>
-            </div>
-
-            <button
-              type="button"
-              onClick={() => {
-                setActiveModal(null);
-                onNavigate('PROFILE');
-              }}
-              className="w-full py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-sky-300 font-bold text-xs flex items-center justify-center gap-2 transition-colors"
-            >
-              <BarChart3 className="w-4 h-4" />
-              <span>عرض إحصائيات ورسوم تطور اللاعب</span>
-            </button>
-          </div>
-        </div>
-      )}
+      {/* Comprehensive Fatteshha Store Modal (المتجر الشامل) */}
+      <StoreModal
+        isOpen={activeModal === 'STORE'}
+        onClose={() => setActiveModal(null)}
+        user={user}
+        onUpdateUser={onUpdateUser}
+        onNavigate={onNavigate}
+        initialTab="OFFERS"
+      />
 
       {/* Daily Challenges Modal (التحديات اليومية - 3 مهام) */}
       <DailyChallengesModal

@@ -33,6 +33,7 @@ import { ResultsModal } from './screens/ResultsModal';
 import { sounds } from './utils/audio';
 import {
   saveUserToLocalMap,
+  syncProfileWithSupabase,
   getLocalUserProfile,
   safeApiJson,
   supabase,
@@ -114,10 +115,15 @@ export default function App() {
         } catch {
           savedUser = '';
         }
-        const headers: Record<string, string> = {};
-        if (savedUser) {
-          headers['x-user-id'] = savedUser;
+        if (!savedUser || savedUser === 'ahmad_kwt' || savedUser === 'dana_q8') {
+          try {
+            localStorage.removeItem('fatteshha_active_user');
+          } catch {
+            // ignore
+          }
+          return;
         }
+        const headers: Record<string, string> = { 'x-user-id': savedUser };
         const data = await safeApiJson<{ success?: boolean; user?: PlayerProfile }>('/api/auth/me', { headers });
         if (data?.success && data.user) {
           handleSelectActiveProfile(data.user);
@@ -198,8 +204,10 @@ export default function App() {
     score: number,
     accuracy: number = 100,
     wordsFoundCount: number = 5,
-    hintsUsedCount: number = 0
+    hintsUsedCount: number = 0,
+    doubleBoostActive: boolean = false
   ) => {
+    const rewardMultiplier = doubleBoostActive ? 2 : 1;
     try {
       const data = await safeApiJson<{
         success?: boolean;
@@ -226,13 +234,32 @@ export default function App() {
       });
 
       if (data?.success && data.user) {
-        handleSelectActiveProfile(data.user);
+        const baseXP = data.earnedXP || 140;
+        const baseCoins = data.earnedCoins || 175;
+        const extraXP = doubleBoostActive ? baseXP : 0;
+        const extraCoins = doubleBoostActive ? baseCoins : 0;
+        const finalXP = (data.user.xp || 0) + extraXP;
+        const enrichedApiUser = saveUserToLocalMap({
+          ...data.user,
+          xp: finalXP,
+          level: Math.floor(finalXP / 300) + 1,
+          coins: (data.user.coins || 0) + extraCoins,
+          seasonXp: (activeProfile?.seasonXp || activeProfile?.xp || 0) + baseXP * rewardMultiplier,
+          totalScore: (activeProfile?.totalScore || 0) + score,
+          totalWordsFound: (activeProfile?.totalWordsFound || 0) + wordsFoundCount,
+          fastStagesCount:
+            (activeProfile?.fastStagesCount || 0) + (timeSpent < 45 ? 1 : 0),
+          perfectStagesCount:
+            (activeProfile?.perfectStagesCount || 0) + (accuracy >= 100 ? 1 : 0)
+        });
+        handleSelectActiveProfile(enrichedApiUser);
+        syncProfileWithSupabase(enrichedApiUser);
         setResultsData({
           stars,
           timeSpent,
           score,
-          earnedXP: data.earnedXP || 140,
-          earnedCoins: data.earnedCoins || 175,
+          earnedXP: baseXP * rewardMultiplier,
+          earnedCoins: baseCoins * rewardMultiplier,
           levelUp: data.levelUp || false,
           wordsFoundCount,
           totalWordsCount: selectedLevelInfo.words.length || wordsFoundCount,
@@ -247,8 +274,8 @@ export default function App() {
     }
 
     // Local / Static host (Vercel / Netlify) progression update
-    const earnedXP = 50 + stars * 20 + Math.max(0, 100 - Math.floor(timeSpent));
-    const earnedCoins = 10 + stars * 5;
+    const earnedXP = (50 + stars * 20 + Math.max(0, 100 - Math.floor(timeSpent))) * rewardMultiplier;
+    const earnedCoins = (10 + stars * 5) * rewardMultiplier;
     if (activeProfile) {
       const levelKey = `${selectedCategory.id}_${selectedLevelInfo.levelNumber}`;
       const existing = activeProfile.completedLevels?.[levelKey];
@@ -265,15 +292,21 @@ export default function App() {
       const nextXP = (activeProfile.xp || 0) + earnedXP;
       const prevLevel = Math.floor((activeProfile.xp || 0) / 300) + 1;
       const nextLevel = Math.floor(nextXP / 300) + 1;
-      const updatedUser: PlayerProfile = {
+      const updatedUser: PlayerProfile = saveUserToLocalMap({
         ...activeProfile,
         xp: nextXP,
+        seasonXp: (activeProfile.seasonXp || activeProfile.xp || 0) + earnedXP,
         level: nextLevel,
         coins: (activeProfile.coins || 0) + earnedCoins,
+        totalScore: (activeProfile.totalScore || 0) + score,
+        totalWordsFound: (activeProfile.totalWordsFound || 0) + wordsFoundCount,
+        fastStagesCount: (activeProfile.fastStagesCount || 0) + (timeSpent < 45 ? 1 : 0),
+        perfectStagesCount: (activeProfile.perfectStagesCount || 0) + (accuracy >= 100 ? 1 : 0),
         completedLevels: nextCompleted,
         completedLevelsCount: Object.keys(nextCompleted).length
-      };
+      });
       handleSelectActiveProfile(updatedUser);
+      syncProfileWithSupabase(updatedUser);
       setResultsData({
         stars,
         timeSpent,
@@ -476,6 +509,7 @@ export default function App() {
             initialRoom={onlineRoom}
             socket={onlineSocket}
             currentUser={activeProfile}
+            onUpdateUser={handleSelectActiveProfile}
             myPlayerId={onlinePlayerId}
             onExit={() => setCurrentScreen('ONLINE_LOBBY')}
             tvMode={tvMode}

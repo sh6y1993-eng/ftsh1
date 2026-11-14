@@ -1,11 +1,17 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Category, LevelInfo, PlayerProfile, ScreenState } from '../types/game';
+import { Category, LevelInfo, PlayerProfile, ScreenState, HintType } from '../types/game';
 import { generateWordSearchGrid, GeneratedBoard } from '../engine/wordSearch';
-import { KUWAITI_PRAISES, KUWAITI_MISTAKES, KUWAITI_HINT_MESSAGES } from '../engine/gameCategories';
+import {
+  KUWAITI_PRAISES,
+  KUWAITI_MISTAKES,
+  KUWAITI_HINT_MESSAGES,
+  HINT_DEFINITIONS
+} from '../engine/gameCategories';
 import { GameBoard } from '../components/GameBoard';
 import { WordBank } from '../components/WordBank';
 import { TVRemoteHint } from '../components/TVRemoteHint';
 import { DailyChallengesModal } from '../components/DailyChallengesModal';
+import { StoreModal } from '../components/StoreModal';
 import {
   Lightbulb,
   Clock,
@@ -27,11 +33,12 @@ import {
   BookOpen,
   Search,
   Star,
-  AlertTriangle,
   Shuffle,
+  ShoppingBag,
   X
 } from 'lucide-react';
 import { sounds } from '../utils/audio';
+import { saveUserToLocalMap, syncProfileWithSupabase } from '../services/supabaseClient';
 
 interface SoloGameScreenProps {
   category: Category;
@@ -48,7 +55,8 @@ interface SoloGameScreenProps {
     score: number,
     accuracy: number,
     wordsFoundCount: number,
-    hintsUsedCount: number
+    hintsUsedCount: number,
+    doubleBoostActive?: boolean
   ) => void;
   onExit: () => void;
   tvMode: boolean;
@@ -81,11 +89,18 @@ export const SoloGameScreen: React.FC<SoloGameScreenProps> = ({
   const [statusBanner, setStatusBanner] = useState<string>('');
   const [hintCell, setHintCell] = useState<{ row: number; col: number } | null>(null);
   const [hintPlacement, setHintPlacement] = useState<import('../types/game').WordPlacement | null>(null);
+  const [revealedCells, setRevealedCells] = useState<{ row: number; col: number; label?: string }[]>([]);
+  const [showWordLengths, setShowWordLengths] = useState(false);
+  const [dimUnusedCells, setDimUnusedCells] = useState(false);
   const [hintsAvailable, setHintsAvailable] = useState(user?.hintsRemaining ?? 5);
   const [dailyToast, setDailyToast] = useState<string>('');
   const [copiedCode, setCopiedCode] = useState(false);
   const [showInfoModal, setShowInfoModal] = useState(false);
   const [showDailyModal, setShowDailyModal] = useState(false);
+  const [showHintsPickerModal, setShowHintsPickerModal] = useState(false);
+  const [showStoreModal, setShowStoreModal] = useState(false);
+  const [freezeSecondsRemaining, setFreezeSecondsRemaining] = useState(0);
+  const [doubleBoostActive, setDoubleBoostActive] = useState(false);
 
   const timerRef = useRef<NodeJS.Timeout | null>(null);
   const hintTimeoutRef = useRef<NodeJS.Timeout | null>(null);
@@ -138,6 +153,11 @@ export const SoloGameScreen: React.FC<SoloGameScreenProps> = ({
       setIsTimedOut(false);
       setHintCell(null);
       setHintPlacement(null);
+      setRevealedCells([]);
+      setShowWordLengths(false);
+      setDimUnusedCells(false);
+      setFreezeSecondsRemaining(0);
+      setDoubleBoostActive(false);
       setStatusBanner(
         isReplay
           ? tvMode
@@ -163,11 +183,15 @@ export const SoloGameScreen: React.FC<SoloGameScreenProps> = ({
     }
   }, [replayTrigger, initGame]);
 
-  // Game timer loop (2-minute countdown timer / 120 seconds max)
+  // Game timer loop (2-minute countdown timer / 120 seconds max, pauses during FREEZE_TIME)
   useEffect(() => {
     if (isPaused || !board || isTimedOut) return;
 
     timerRef.current = setInterval(() => {
+      if (freezeSecondsRemaining > 0) {
+        setFreezeSecondsRemaining(f => Math.max(0, f - 1));
+        return;
+      }
       setSeconds(s => {
         const next = s + 1;
         if (next >= STAGE_TIME_LIMIT) {
@@ -183,7 +207,7 @@ export const SoloGameScreen: React.FC<SoloGameScreenProps> = ({
     return () => {
       if (timerRef.current) clearInterval(timerRef.current);
     };
-  }, [isPaused, board, isTimedOut]);
+  }, [isPaused, board, isTimedOut, freezeSecondsRemaining]);
 
   // Handle word discovery
   const handleWordFound = (word: string) => {
@@ -250,9 +274,50 @@ export const SoloGameScreen: React.FC<SoloGameScreenProps> = ({
         totalAttempts > 0 ? Math.round((updated.length / totalAttempts) * 100) : 100;
 
       setTimeout(() => {
-        onLevelComplete(stars, seconds, score + pts, finalAccuracy, updated.length, hintsUsedCount);
+        onLevelComplete(
+          stars,
+          seconds,
+          score + pts,
+          finalAccuracy,
+          updated.length,
+          hintsUsedCount,
+          doubleBoostActive
+        );
       }, 650);
     }
+  };
+
+  // Use Solo Power-Ups (FREEZE_TIME or DOUBLE_BOOST)
+  const handleUsePowerUp = (puId: 'FREEZE_TIME' | 'DOUBLE_BOOST') => {
+    if (!user || !onUpdateUser) return;
+    const owned = user.powerUps?.[puId] || 0;
+    if (owned <= 0) {
+      sounds.playError();
+      setShowStoreModal(true);
+      return;
+    }
+
+    if (puId === 'FREEZE_TIME') {
+      if (freezeSecondsRemaining > 0) return;
+      sounds.playVictory();
+      setFreezeSecondsRemaining(30);
+      setStatusBanner('❄️ تم تفعيل تجميد الوقت لمدة 30 ثانية كاملة!');
+    } else if (puId === 'DOUBLE_BOOST') {
+      if (doubleBoostActive) return;
+      sounds.playVictory();
+      setDoubleBoostActive(true);
+      setStatusBanner('⚡ تم تفعيل مضاعف العملات والخبرة (2x) لهذه المرحلة!');
+    }
+
+    const updated = saveUserToLocalMap({
+      ...user,
+      powerUps: {
+        ...(user.powerUps || {}),
+        [puId]: Math.max(0, owned - 1)
+      }
+    });
+    onUpdateUser(updated);
+    syncProfileWithSupabase(updated);
   };
 
   // Handle wrong selection mistake
@@ -262,52 +327,88 @@ export const SoloGameScreen: React.FC<SoloGameScreenProps> = ({
     setStatusBanner(mistakeMsg);
   };
 
-  // Handle Hint trigger with full-word pulse & brief reveal animation
-  const handleUseHint = async () => {
-    if (hintsAvailable <= 0) {
-      sounds.playError();
-      setStatusBanner('ما عندك تلميحات كافية يا الحبيب! اشترِ من المتجر 💡');
-      return;
-    }
-
+  // Execute any of the 5 proposed Hint Types (using Hints balance OR عملات فتّشها)
+  const handleApplyHintType = async (hintType: HintType) => {
     if (!board) return;
-
     const remaining = board.wordPlacements.filter(p => !foundWords.includes(p.word));
     if (remaining.length === 0) return;
 
-    const target = remaining[0];
-    const firstCell = target.cells[0];
+    const def = HINT_DEFINITIONS.find(h => h.id === hintType) || HINT_DEFINITIONS[0];
+    const currentCoins = user?.coins ?? 150;
+
+    let nextHints = hintsAvailable;
+    let nextCoins = currentCoins;
+
+    if (hintsAvailable >= def.hintCost) {
+      nextHints = Math.max(0, hintsAvailable - def.hintCost);
+    } else if (currentCoins >= def.coinCost) {
+      nextCoins = Math.max(0, currentCoins - def.coinCost);
+    } else {
+      sounds.playError();
+      setStatusBanner(`رصيدك لا يكفي لتلميح «${def.name}»! افتح متجر عملات فتّشها أو استلم مكافأتك اليومية 💡`);
+      setShowHintsPickerModal(false);
+      setShowStoreModal(true);
+      return;
+    }
 
     sounds.playHint();
-    setHintCell(firstCell);
-    setHintPlacement(target);
-    setHintsAvailable(h => Math.max(0, h - 1));
+    setHintsAvailable(nextHints);
     setHintsUsedCount(c => c + 1);
+    setShowHintsPickerModal(false);
 
-    try {
-      const res = await fetch('/api/hints/use', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username: user?.username || 'ahmad_kwt' })
+    if (user && onUpdateUser) {
+      const updated = saveUserToLocalMap({
+        ...user,
+        hintsRemaining: nextHints,
+        coins: nextCoins
       });
-      const data = await res.json();
-      if (data.success && user && onUpdateUser) {
-        onUpdateUser({ ...user, hintsRemaining: data.hintsRemaining });
+      onUpdateUser(updated);
+      syncProfileWithSupabase(updated);
+    }
+
+    const target = remaining[0];
+
+    if (hintType === 'SINGLE_LETTER') {
+      // 1. كشف حرف واحد
+      const unrevealedCell =
+        target.cells.find(
+          c => !revealedCells.some(rc => rc.row === c.row && rc.col === c.col)
+        ) || target.cells[Math.floor(Math.random() * target.cells.length)];
+
+      setRevealedCells(prev => [...prev, { row: unrevealedCell.row, col: unrevealedCell.col, label: 'حرف 💡' }]);
+      setStatusBanner(`🔤 تلميح (كشف حرف واحد): تم تمييز حرف من كلمة مطلوبة على الشبكة!`);
+    } else if (hintType === 'WORD_START') {
+      // 2. إظهار مكان بداية الكلمة
+      const startCell = target.cells[0];
+      setRevealedCells(prev => [
+        ...prev.filter(rc => !(rc.row === startCell.row && rc.col === startCell.col)),
+        { row: startCell.row, col: startCell.col, label: '١ • بداية' }
+      ]);
+      setHintCell(startCell);
+      setStatusBanner(`🎯 تلميح (بداية الكلمة): الكلمة «${target.displayWord}» تبدأ من الخانة الذهبية المرقمة بـ (١ • بداية)!`);
+    } else if (hintType === 'WORD_LENGTH') {
+      // 3. إظهار عدد الحروف
+      setShowWordLengths(true);
+      setStatusBanner(`📏 تلميح (عدد الحروف): تم إظهار عدد حروف كل كلمة متبقية في بنك الكلمات!`);
+    } else if (hintType === 'REMOVE_UNUSED') {
+      // 4. إزالة الحروف غير المستخدمة
+      setDimUnusedCells(true);
+      setStatusBanner(`🧹 تلميح (إزالة الحروف غير المستخدمة): تم تعتيم الحروف الزائدة وبقيت حروف الكلمات فقط!`);
+    } else if (hintType === 'FULL_WORD') {
+      // 5. كشف كلمة كاملة مقابل تكلفة أعلى
+      setHintPlacement(target);
+      setStatusBanner(
+        `${KUWAITI_HINT_MESSAGES[Math.floor(Math.random() * KUWAITI_HINT_MESSAGES.length)]} — تم كشف الكلمة الكاملة «${target.displayWord}»! 🌟`
+      );
+      if (hintTimeoutRef.current) {
+        clearTimeout(hintTimeoutRef.current);
       }
-    } catch {
-      // offline safe
+      hintTimeoutRef.current = setTimeout(() => {
+        setHintPlacement(null);
+      }, 4500);
+      // Also auto-claim the word for the player after a brief highlight
+      handleWordFound(target.word);
     }
-
-    const hintMsg = `${KUWAITI_HINT_MESSAGES[Math.floor(Math.random() * KUWAITI_HINT_MESSAGES.length)]} — الكلمة «${target.displayWord}» تتوهج الآن على الشبكة! 💡`;
-    setStatusBanner(hintMsg);
-
-    if (hintTimeoutRef.current) {
-      clearTimeout(hintTimeoutRef.current);
-    }
-    hintTimeoutRef.current = setTimeout(() => {
-      setHintPlacement(null);
-      setHintCell(null);
-    }, 3800);
   };
 
   const handleCopyRoomCode = () => {
@@ -730,24 +831,31 @@ export const SoloGameScreen: React.FC<SoloGameScreenProps> = ({
 
           {/* Left Zone (RTL): Dynamic Player Coins/Hints + TV + Sound + Active Player Capsule */}
           <div className="flex items-center gap-2">
-            {/* Coins & Hints Capsule */}
-            <div
-              className="px-3 py-1 rounded-full flex items-center gap-2 text-xs font-black tabular-nums"
+            {/* Coins & Hints Capsule (Opens Fatteshha Economy Store) */}
+            <button
+              type="button"
+              onClick={() => {
+                sounds.playTap();
+                setShowStoreModal(true);
+              }}
+              className="px-3 py-1 rounded-full flex items-center gap-2 text-xs font-black tabular-nums cursor-pointer hover:brightness-110 transition-all"
               style={{
                 background: 'rgba(6, 20, 34, 0.9)',
                 border: '1px solid rgba(56, 189, 248, 0.35)'
               }}
+              title="متجر عملات فتّشها والمكافآت اليومية"
             >
               <span className="flex items-center gap-1 text-amber-400">
                 <Coins className="w-3.5 h-3.5 text-amber-400" />
-                <span>{user?.coins ?? 100}</span>
+                <span>{user?.coins ?? 150}</span>
               </span>
               <span className="text-slate-600">/</span>
               <span className="flex items-center gap-1 text-cyan-300">
                 <span>{hintsAvailable}</span>
                 <Lightbulb className="w-3.5 h-3.5 text-cyan-400" />
               </span>
-            </div>
+              <ShoppingBag className="w-3.5 h-3.5 text-lime-400 ml-0.5" />
+            </button>
 
             {/* TV Mode Button */}
             <button
@@ -861,7 +969,9 @@ export const SoloGameScreen: React.FC<SoloGameScreenProps> = ({
             {/* 2-Minute Stage Countdown Timer Pill */}
             <div
               className={`px-3.5 py-1.5 rounded-full flex items-center gap-1.5 text-xs font-black font-mono tabular-nums transition-all ${
-                remainingSeconds <= 20
+                freezeSecondsRemaining > 0
+                  ? 'bg-cyan-950/95 text-cyan-200 border-2 border-cyan-300 shadow-[0_0_16px_rgba(34,211,238,0.65)]'
+                  : remainingSeconds <= 20
                   ? 'bg-rose-950/90 text-rose-300 border-2 border-rose-500 animate-pulse'
                   : remainingSeconds <= 60
                   ? 'bg-amber-950/90 text-amber-300 border border-amber-500/70'
@@ -871,29 +981,58 @@ export const SoloGameScreen: React.FC<SoloGameScreenProps> = ({
             >
               <Clock
                 className={`w-4 h-4 ${
-                  remainingSeconds <= 20
+                  freezeSecondsRemaining > 0
+                    ? 'text-cyan-300'
+                    : remainingSeconds <= 20
                     ? 'text-rose-400 animate-bounce'
                     : remainingSeconds <= 60
                     ? 'text-amber-400'
                     : 'text-cyan-400'
                 }`}
               />
-              <span>{formatTime(remainingSeconds)}</span>
-              <span className="text-[10px] text-slate-400 font-sans hidden sm:inline">(دقيقتين)</span>
+              <span>
+                {freezeSecondsRemaining > 0
+                  ? `❄️ مجمد (${freezeSecondsRemaining}ث)`
+                  : formatTime(remainingSeconds)}
+              </span>
+              {freezeSecondsRemaining === 0 && (
+                <span className="text-[10px] text-slate-400 font-sans hidden sm:inline">(دقيقتين)</span>
+              )}
             </div>
 
-            {/* Hint Button */}
+            {/* 5 Hint Types Picker Button */}
             <button
-              onClick={handleUseHint}
+              onClick={() => {
+                sounds.playTap();
+                setShowHintsPickerModal(true);
+              }}
               className="px-3.5 py-1.5 rounded-full flex items-center gap-1.5 text-xs font-black text-emerald-200 transition-transform active:scale-95 cursor-pointer tabular-nums"
               style={{
                 background: 'linear-gradient(180deg, #0d4a4d 0%, #072c30 100%)',
                 border: '1.5px solid rgba(52, 211, 153, 0.65)',
                 boxShadow: '0 0 12px rgba(16, 185, 129, 0.25)'
               }}
+              title="اختر نوع التلميح (5 أنواع تلميحات ذكية)"
             >
               <Lightbulb className="w-4 h-4 text-emerald-300" />
-              <span>تلميح ({hintsAvailable})</span>
+              <span>التلميحات الـ5 ({hintsAvailable})</span>
+            </button>
+
+            {/* Fatteshha Store Button */}
+            <button
+              onClick={() => {
+                sounds.playTap();
+                setShowStoreModal(true);
+              }}
+              className="px-3 py-1.5 rounded-full flex items-center gap-1.5 text-xs font-black text-amber-200 transition-transform active:scale-95 cursor-pointer"
+              style={{
+                background: 'linear-gradient(180deg, #452708 0%, #291603 100%)',
+                border: '1.5px solid rgba(251, 191, 36, 0.65)'
+              }}
+              title="متجر عملات فتّشها والمكافآت"
+            >
+              <ShoppingBag className="w-3.5 h-3.5 text-amber-300" />
+              <span>المتجر</span>
             </button>
 
             {/* Shuffle / Reset Grid Button */}
@@ -1046,7 +1185,78 @@ export const SoloGameScreen: React.FC<SoloGameScreenProps> = ({
             wordPlacements={board.wordPlacements}
             foundWords={foundWords}
             hintWord={hintPlacement?.word || null}
+            showWordLengths={showWordLengths}
           />
+        </div>
+
+        {/* ------------------------------------------------------------------- */}
+        {/* ROW 6.5: QUICK 5 HINT TYPES BAR (أنواع التلميحات الخمسة المقترحة)   */}
+        {/* ------------------------------------------------------------------- */}
+        <div className="max-w-4xl mx-auto">
+          <div
+            className="rounded-2xl px-3 py-2 flex items-center justify-between gap-2 overflow-x-auto"
+            style={{
+              background: 'linear-gradient(180deg, rgba(7, 26, 43, 0.92) 0%, rgba(4, 15, 25, 0.96) 100%)',
+              border: '1.5px solid rgba(52, 211, 153, 0.4)'
+            }}
+          >
+            <div className="flex items-center gap-1.5 text-xs font-black text-emerald-300 shrink-0">
+              <Lightbulb className="w-4 h-4 text-amber-300" />
+              <span>وسائل المساعدة:</span>
+            </div>
+            <div className="flex items-center gap-1.5 overflow-x-auto py-0.5">
+              {/* Quick Power-Ups in Stage */}
+              <button
+                type="button"
+                onClick={() => handleUsePowerUp('FREEZE_TIME')}
+                className={`px-2.5 py-1 rounded-xl border text-[11px] font-black flex items-center gap-1 shrink-0 cursor-pointer transition-all ${
+                  freezeSecondsRemaining > 0
+                    ? 'bg-cyan-500/30 border-cyan-300 text-cyan-100'
+                    : 'bg-[#082c42] hover:bg-[#0d3f5e] border-cyan-400/50 text-cyan-200'
+                }`}
+                title="تجميد الوقت 30 ثانية"
+              >
+                <span>❄️ تجميد الوقت</span>
+                <span className="px-1.5 rounded-full bg-cyan-400/20 text-cyan-200 font-mono text-[10px]">
+                  ×{user?.powerUps?.FREEZE_TIME ?? 0}
+                </span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleUsePowerUp('DOUBLE_BOOST')}
+                className={`px-2.5 py-1 rounded-xl border text-[11px] font-black flex items-center gap-1 shrink-0 cursor-pointer transition-all ${
+                  doubleBoostActive
+                    ? 'bg-amber-400 text-slate-950 border-amber-200'
+                    : 'bg-[#2a2208] hover:bg-[#40340c] border-amber-400/50 text-amber-200'
+                }`}
+                title="مضاعف العملات والخبرة 2x"
+              >
+                <span>{doubleBoostActive ? '⚡ مضاعف 2x مُفعّل ✓' : '⚡ مضاعف 2x'}</span>
+                {!doubleBoostActive && (
+                  <span className="px-1.5 rounded-full bg-amber-400/20 text-amber-200 font-mono text-[10px]">
+                    ×{user?.powerUps?.DOUBLE_BOOST ?? 0}
+                  </span>
+                )}
+              </button>
+
+              {HINT_DEFINITIONS.map((h) => (
+                <button
+                  key={h.id}
+                  type="button"
+                  onClick={() => handleApplyHintType(h.id)}
+                  className="px-2.5 py-1 rounded-xl bg-[#0b2940] hover:bg-[#123d5e] border border-cyan-400/35 hover:border-amber-400/70 text-[11px] font-black text-white flex items-center gap-1.5 shrink-0 cursor-pointer transition-all active:scale-95"
+                  title={`${h.description} (التكلفة: ${h.hintCost} تلميح أو ${h.coinCost} عملة فتّشها)`}
+                >
+                  <span>{h.badge}</span>
+                  <span>{h.name}</span>
+                  <span className="px-1.5 py-0.2 rounded-full bg-amber-400/20 border border-amber-400/50 text-amber-300 font-mono text-[10px]">
+                    {hintsAvailable >= h.hintCost ? `${h.hintCost}💡` : `${h.coinCost}🪙`}
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>
         </div>
 
         {/* ------------------------------------------------------------------- */}
@@ -1062,10 +1272,98 @@ export const SoloGameScreen: React.FC<SoloGameScreenProps> = ({
             onWordMistake={handleWordMistake}
             hintCell={hintCell}
             hintPlacement={hintPlacement}
+            revealedCells={revealedCells}
+            dimUnusedCells={dimUnusedCells}
+            boardThemeId={user?.equippedBoardTheme}
+            trailStyleId={user?.equippedTrail}
             tvMode={tvMode}
           />
         </div>
       </div>
+
+      {/* ===================================================================== */}
+      {/* 5 HINT TYPES MODAL (أنواع التلميحات الخمسة بعملات فتّشها أو الرصيد)     */}
+      {/* ===================================================================== */}
+      {showHintsPickerModal && (
+        <div
+          className="fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-md flex items-center justify-center p-4"
+          dir="rtl"
+          onClick={() => setShowHintsPickerModal(false)}
+        >
+          <div
+            className="max-w-lg w-full rounded-3xl p-5 sm:p-6 text-right border-2 border-emerald-400/60 shadow-[0_0_40px_rgba(16,185,129,0.3)] space-y-4"
+            style={{
+              background: 'linear-gradient(180deg, #08263a 0%, #041320 100%)'
+            }}
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+              <div className="flex items-center gap-2.5">
+                <div className="w-9 h-9 rounded-2xl bg-emerald-400/20 border border-emerald-400/50 flex items-center justify-center text-emerald-300">
+                  <Lightbulb className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-base sm:text-lg font-black text-white">
+                    أنواع التلميحات المساعدة (5 خيارات)
+                  </h3>
+                  <span className="text-xs text-slate-300 font-bold">
+                    رصيدك: <strong className="text-cyan-300">{hintsAvailable} تلميح 💡</strong> •{' '}
+                    <strong className="text-amber-300">{user?.coins ?? 150} عملة فتّشها 🪙</strong>
+                  </span>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowHintsPickerModal(false)}
+                className="p-1.5 rounded-xl bg-slate-800 text-slate-400 hover:text-white cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="space-y-2.5">
+              {HINT_DEFINITIONS.map((h, idx) => (
+                <div
+                  key={h.id}
+                  className="p-3 rounded-2xl bg-[#051a29] border border-cyan-500/30 hover:border-emerald-400/60 flex items-center justify-between gap-3 transition-all"
+                >
+                  <div className="flex items-center gap-3">
+                    <div className="w-10 h-10 rounded-2xl bg-slate-900 border border-cyan-400/30 flex items-center justify-center text-xs font-black text-amber-300 shrink-0">
+                      {h.badge}
+                    </div>
+                    <div>
+                      <div className="text-xs sm:text-sm font-black text-white">
+                        {idx + 1}. {h.name}
+                      </div>
+                      <div className="text-[11px] text-slate-300 font-bold">{h.description}</div>
+                    </div>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => handleApplyHintType(h.id)}
+                    className="px-3.5 py-2 rounded-xl bg-gradient-to-b from-[#a3e635] to-[#65a30d] text-slate-950 font-black text-xs shrink-0 cursor-pointer shadow hover:brightness-110 active:scale-95"
+                  >
+                    {hintsAvailable >= h.hintCost
+                      ? `استخدام (${h.hintCost} 💡)`
+                      : `شراء (${h.coinCost} 🪙)`}
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Comprehensive Fatteshha Store Modal */}
+      <StoreModal
+        isOpen={showStoreModal}
+        onClose={() => setShowStoreModal(false)}
+        user={user}
+        onUpdateUser={onUpdateUser}
+        onNavigate={onNavigate}
+        initialTab="POWERUPS"
+      />
 
       {/* Stage Info Modal (when clicking ⓘ) */}
       {showInfoModal && (
@@ -1474,7 +1772,18 @@ export const SoloGameScreen: React.FC<SoloGameScreenProps> = ({
               type="button"
               onClick={() => {
                 sounds.playTap();
-                // Give +60 seconds overtime extension
+                const extendCount = user?.powerUps?.TIME_EXTEND || 0;
+                if (extendCount > 0 && user && onUpdateUser) {
+                  const updated = saveUserToLocalMap({
+                    ...user,
+                    powerUps: {
+                      ...(user.powerUps || {}),
+                      TIME_EXTEND: Math.max(0, extendCount - 1)
+                    }
+                  });
+                  onUpdateUser(updated);
+                  syncProfileWithSupabase(updated);
+                }
                 setSeconds(s => Math.max(0, s - 60));
                 setIsTimedOut(false);
               }}
@@ -1486,7 +1795,11 @@ export const SoloGameScreen: React.FC<SoloGameScreenProps> = ({
               <div className="w-6 h-6 sm:w-7 sm:h-7 rounded-full bg-cyan-500/25 border border-cyan-400 flex items-center justify-center text-cyan-300">
                 <Clock className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-cyan-300" />
               </div>
-              <span>تمديد دقيقة إضافية (+60 ثانية) للمواصلة</span>
+              <span>
+                {(user?.powerUps?.TIME_EXTEND || 0) > 0
+                  ? `⏳ استخدام تذكرة تمديد (+60ث) • لديك ×${user?.powerUps?.TIME_EXTEND}`
+                  : 'تمديد دقيقة إضافية (+60 ثانية) للمواصلة'}
+              </span>
             </button>
 
             {/* =============================================================== */}

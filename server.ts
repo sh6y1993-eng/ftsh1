@@ -1668,6 +1668,7 @@ if (!activeRooms['KWT55']) {
 }
 
 const roomBotTimers: Record<string, NodeJS.Timeout[]> = {};
+const roomActiveShields: Record<string, Record<string, boolean>> = {};
 
 function clearRoomBotTimers(roomCode: string) {
   const list = roomBotTimers[roomCode];
@@ -2495,6 +2496,7 @@ wss.on('connection', (ws) => {
           if (!room) return;
 
           clearRoomBotTimers(code);
+          delete roomActiveShields[code];
 
           // Keep the EXACT same categoryId without changing it, generate a fresh board immediately!
           const freshBoard = createAuthoritativeBoard(room.categoryId, 10, 7);
@@ -2556,6 +2558,79 @@ wss.on('connection', (ws) => {
         case 'WORD_FOUND': {
           const { code, word, playerId } = payload;
           claimWordInRoom(code, word, playerId, ws);
+          break;
+        }
+
+        case 'USE_BATTLE_CARD': {
+          const { code, cardId, playerId } = payload || {};
+          const room = activeRooms[code];
+          if (!room || room.state !== 'PLAYING') return;
+
+          const sender = room.players[playerId];
+          if (!sender) return;
+          const target = Object.values(room.players).find(p => p.id !== playerId);
+
+          if (!roomActiveShields[code]) {
+            roomActiveShields[code] = {};
+          }
+
+          if (cardId === 'CARD_SHIELD') {
+            roomActiveShields[code][playerId] = true;
+            broadcastToRoom(code, {
+              type: 'BATTLE_CARD_APPLIED',
+              payload: {
+                cardId,
+                senderId: playerId,
+                senderName: sender.displayName,
+                targetId: playerId,
+                targetName: sender.displayName,
+                blockedByShield: false,
+                stolenAmount: 0,
+                room
+              }
+            });
+            break;
+          }
+
+          const hasShield = target && Boolean(roomActiveShields[code][target.id]);
+          if (hasShield && target) {
+            roomActiveShields[code][target.id] = false;
+            broadcastToRoom(code, {
+              type: 'BATTLE_CARD_APPLIED',
+              payload: {
+                cardId,
+                senderId: playerId,
+                senderName: sender.displayName,
+                targetId: target.id,
+                targetName: target.displayName,
+                blockedByShield: true,
+                stolenAmount: 0,
+                room
+              }
+            });
+            break;
+          }
+
+          let stolenAmount = 0;
+          if (cardId === 'CARD_STEAL_POINTS' && target) {
+            stolenAmount = Math.min(100, Math.max(0, target.score || 0));
+            target.score = Math.max(0, (target.score || 0) - stolenAmount);
+            sender.score = (sender.score || 0) + stolenAmount;
+          }
+
+          broadcastToRoom(code, {
+            type: 'BATTLE_CARD_APPLIED',
+            payload: {
+              cardId,
+              senderId: playerId,
+              senderName: sender.displayName,
+              targetId: target?.id,
+              targetName: target?.displayName,
+              blockedByShield: false,
+              stolenAmount,
+              room
+            }
+          });
           break;
         }
 

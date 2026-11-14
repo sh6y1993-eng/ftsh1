@@ -7,7 +7,7 @@ import {
   ScreenState,
   FriendProfileSummary
 } from '../types/game';
-import { CATEGORIES, getRandomCategoryWords } from '../engine/gameCategories';
+import { CATEGORIES, PREMIUM_CATEGORIES, findCategoryById, getRandomCategoryWords } from '../engine/gameCategories';
 import { generateWordSearchGrid } from '../engine/wordSearch';
 import { FriendsModal } from '../components/FriendsModal';
 import { realtimeSync } from '../services/realtimeSync';
@@ -1150,7 +1150,7 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
   };
 
   const getCategoryName = (catId: string) => {
-    return CATEGORIES.find(c => c.id === catId)?.name || 'الكويت';
+    return findCategoryById(catId)?.name || 'الكويت';
   };
 
   // ============================================================================
@@ -1786,7 +1786,10 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
                 <div
                   className="mt-2 p-2.5 rounded-2xl border border-cyan-400/60 bg-[#051826]/98 shadow-2xl grid grid-cols-3 gap-2 z-30 relative"
                 >
-                  {CATEGORIES.map((cat) => {
+                  {[
+                    ...CATEGORIES,
+                    ...PREMIUM_CATEGORIES.filter(pc => (user?.unlockedCategories || []).includes(pc.id))
+                  ].map((cat) => {
                     const isSelected = selectedCategory === cat.id;
                     return (
                       <button

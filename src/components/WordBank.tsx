@@ -11,6 +11,9 @@ interface WordBankProps {
   currentPlayerId?: string;
   currentPlayerName?: string;
   hintWord?: string | null;
+  showWordLengths?: boolean;
+  maskUnfoundWords?: boolean;
+  maskedSeconds?: number;
 }
 
 export const WordBank: React.FC<WordBankProps> = ({
@@ -21,7 +24,10 @@ export const WordBank: React.FC<WordBankProps> = ({
   playerIdsMap = {},
   currentPlayerId,
   currentPlayerName,
-  hintWord
+  hintWord,
+  showWordLengths = false,
+  maskUnfoundWords = false,
+  maskedSeconds = 0
 }) => {
   const remainingCount = Math.max(0, wordPlacements.length - foundWords.length);
 
@@ -52,7 +58,11 @@ export const WordBank: React.FC<WordBankProps> = ({
         </div>
 
         <span className="text-xs sm:text-sm font-bold text-slate-200 tabular-nums">
-          {remainingCount === 0 ? 'تم صيد جميع الكلمات! 🎉' : `متبقي ${remainingCount} كلمات للصيد`}
+          {maskUnfoundWords
+            ? `🙈 الخصم أخفى الكلمات (${maskedSeconds}ث)!`
+            : remainingCount === 0
+            ? 'تم صيد جميع الكلمات! 🎉'
+            : `متبقي ${remainingCount} كلمات للصيد`}
         </span>
       </div>
 
@@ -108,7 +118,16 @@ export const WordBank: React.FC<WordBankProps> = ({
                 )
               )}
               {isHinted && <Lightbulb className="w-4 h-4 shrink-0 text-slate-950 fill-amber-400" />}
-              <span className={isFound ? 'line-through decoration-2' : ''}>{placement.displayWord}</span>
+              <span className={isFound ? 'line-through decoration-2' : ''}>
+                {!isFound && maskUnfoundWords
+                  ? '•'.repeat(Math.max(3, placement.displayWord.length))
+                  : placement.displayWord}
+              </span>
+              {!isFound && showWordLengths && (
+                <span className="text-[11px] bg-cyan-500/25 border border-cyan-300/50 text-cyan-200 px-2 py-0.5 rounded-full font-mono font-black">
+                  {placement.word.length} حروف
+                </span>
+              )}
               {isHinted && (
                 <span className="text-[10px] bg-slate-950 text-amber-300 px-2 py-0.5 rounded-full mr-1 font-black">
                   تلميح 💡

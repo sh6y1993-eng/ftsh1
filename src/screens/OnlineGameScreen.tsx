@@ -1,20 +1,28 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { OnlineRoom, PlayerProfile } from '../types/game';
-import { CATEGORIES } from '../engine/gameCategories';
+import { OnlineRoom, PlayerProfile, BattleCardId } from '../types/game';
+import {
+  findCategoryById,
+  BATTLE_CARD_ITEMS,
+  EMOTE_PACK_ITEMS,
+  getNameGlowClass
+} from '../engine/gameCategories';
 import { GameBoard } from '../components/GameBoard';
 import { WordBank } from '../components/WordBank';
 import { KuwaitiCommentary } from '../components/KuwaitiCommentary';
 import { TVRemoteHint } from '../components/TVRemoteHint';
+import { StoreModal } from '../components/StoreModal';
 import { ResultsModal } from './ResultsModal';
-import { ArrowRight, AlertTriangle, Zap, Flame, Volume2, VolumeX } from 'lucide-react';
+import { ArrowRight, AlertTriangle, Zap, Flame, Volume2, VolumeX, ShoppingBag, Shield } from 'lucide-react';
 import { sounds } from '../utils/audio';
 import confetti from 'canvas-confetti';
 import { realtimeSync } from '../services/realtimeSync';
+import { saveUserToLocalMap, syncProfileWithSupabase } from '../services/supabaseClient';
 
 interface OnlineGameScreenProps {
   initialRoom: OnlineRoom;
   socket: WebSocket;
   currentUser: PlayerProfile | null;
+  onUpdateUser?: (user: PlayerProfile) => void;
   myPlayerId?: string;
   onExit: () => void;
   tvMode: boolean;
@@ -24,6 +32,7 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
   initialRoom,
   socket,
   currentUser,
+  onUpdateUser,
   myPlayerId,
   onExit,
   tvMode
@@ -48,21 +57,35 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
   const [winnerInfo, setWinnerInfo] = useState<{ id?: string; name: string } | null>(null);
   const [rematchLoading, setRematchLoading] = useState(false);
   const [soundMuted, setSoundMuted] = useState(sounds.getMuted());
+  const [showStoreModal, setShowStoreModal] = useState(false);
 
-  const QUICK_REACTIONS = [
+  // Battle Card Real-Time Active Effects
+  const [myFrozenSeconds, setMyFrozenSeconds] = useState(0);
+  const [mySandstormSeconds, setMySandstormSeconds] = useState(0);
+  const [myBlindWordsSeconds, setMyBlindWordsSeconds] = useState(0);
+  const [myShieldActive, setMyShieldActive] = useState(false);
+  const [oppDebuffBanner, setOppDebuffBanner] = useState<{ label: string; seconds: number } | null>(null);
+  const [oppShieldActive, setOppShieldActive] = useState(false);
+  const [cardCooldown, setCardCooldown] = useState(0);
+
+  const baseReactions = [
     'صدتها قبلك! ⚡',
     'كفووو! 🔥',
     'يا وحش! 🦅',
     'شد حيلك! 💪',
     'ريماتش؟ 🔄'
   ];
+  const unlockedEmoteExtras = EMOTE_PACK_ITEMS.filter(pack =>
+    (currentUser?.unlockedEmotePacks || []).includes(pack.id)
+  ).flatMap(pack => pack.emotes);
+  const QUICK_REACTIONS = [...baseReactions, ...unlockedEmoteExtras];
 
   const rawPlayerId =
     myPlayerId ||
     sessionStorage.getItem('fatteshha_online_tab_id') ||
     currentUser?.id ||
     `guest_${Date.now()}`;
-  const categoryObj = CATEGORIES.find(c => c.id === room.categoryId) || CATEGORIES[0];
+  const categoryObj = findCategoryById(room.categoryId);
   const playersList = Object.values(room.players);
   const myPlayer =
     room.players[rawPlayerId] ||
@@ -195,10 +218,111 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
           setWinnerInfo(null);
           setRematchLoading(false);
           setDisconnectionNotice(null);
+          setMyFrozenSeconds(0);
+          setMySandstormSeconds(0);
+          setMyBlindWordsSeconds(0);
+          setMyShieldActive(false);
+          setOppShieldActive(false);
+          setOppDebuffBanner(null);
           setCommentType('praise');
           setKuwaitiMsg(
             `🔄 بدأ ${initiatedBy} ريماتش فوري (الجولة ${roundNumber}) في تصنيف «${categoryObj.name}»! اللي يصيد الكلمة أول تنحسب له 🔥`
           );
+        } else if (type === 'BATTLE_CARD_APPLIED') {
+          const {
+            cardId,
+            senderId,
+            senderName,
+            targetId,
+            blockedByShield,
+            stolenAmount,
+            room: updatedRoom
+          } = payload || {};
+          if (updatedRoom) {
+            setRoom(updatedRoom);
+          }
+
+          const cardDef = BATTLE_CARD_ITEMS.find(c => c.id === cardId);
+          const isSenderMe = String(senderId) === String(playerId);
+          const isTargetMe = String(targetId) === String(playerId);
+
+          if (cardId === 'CARD_SHIELD') {
+            sounds.playHint();
+            if (isSenderMe) {
+              setMyShieldActive(true);
+              setKuwaitiMsg('🛡️ فعّلت درع الحماية! سيتم صد كرت الهجوم القادم من خصمك تلقائياً.');
+              setCommentType('praise');
+            } else {
+              setOppShieldActive(true);
+              setKuwaitiMsg(`🛡️ الخصم «${senderName}» فعّل درع الحماية ضد هجماتك!`);
+              setCommentType('neutral');
+            }
+            return;
+          }
+
+          if (blockedByShield) {
+            sounds.playVictory();
+            if (isTargetMe) {
+              setMyShieldActive(false);
+              setRaceFlash({
+                text: `🛡️ درعك صدّ كرت «${cardDef?.shortName || 'الهجوم'}» من الخصم!`,
+                subtext: 'نجوت من التأثير بنجاح 🔥',
+                isMine: true
+              });
+              setKuwaitiMsg(`🛡️ درع الحماية صدّ هجوم الخصم (${cardDef?.name}) عنك!`);
+            } else {
+              setOppShieldActive(false);
+              setRaceFlash({
+                text: `🛡️ درع الخصم صدّ كرت «${cardDef?.shortName || 'الهجوم'}»!`,
+                subtext: 'حاول بكرت آخر لكسر دفاعه',
+                isMine: false
+              });
+              setKuwaitiMsg(`🛡️ الخصم كان محمياً بدرع وصدّ كرتك (${cardDef?.name})!`);
+            }
+            return;
+          }
+
+          if (isTargetMe) {
+            sounds.playError();
+            const effectSeconds = cardDef?.durationSec || 15;
+            if (cardId === 'CARD_FREEZE_OPPONENT') {
+              setMyFrozenSeconds(effectSeconds);
+            } else if (cardId === 'CARD_SANDSTORM') {
+              setMySandstormSeconds(effectSeconds);
+            } else if (cardId === 'CARD_BLIND_WORDS') {
+              setMyBlindWordsSeconds(effectSeconds);
+            }
+            const flashTitle =
+              cardId === 'CARD_STEAL_POINTS'
+                ? `⚡ الخصم «${senderName}» سرق ${stolenAmount || 0} نقطة من رصيدك!`
+                : `${cardDef?.icon || '⚔️'} الخصم «${senderName}» أطلق عليك: ${cardDef?.name || 'كرت هجوم'}!`;
+            setRaceFlash({
+              text: flashTitle,
+              subtext: cardDef?.durationSec ? `التأثير مستمر لمدة ${cardDef.durationSec} ثانية` : 'انتزع الصدارة مجدداً!',
+              isMine: false
+            });
+            setKuwaitiMsg(flashTitle);
+            setCommentType('mistake');
+          } else if (isSenderMe) {
+            sounds.playVictory();
+            if (cardDef?.durationSec) {
+              setOppDebuffBanner({
+                label: `${cardDef.icon} الخصم متأثر بـ ${cardDef.shortName}`,
+                seconds: cardDef.durationSec
+              });
+            }
+            const flashTitle =
+              cardId === 'CARD_STEAL_POINTS'
+                ? `⚡ سرقت +${stolenAmount || 0} نقطة من الخصم وأضفتها لرصيدك!`
+                : `${cardDef?.icon || '⚔️'} أصبت الخصم بـ «${cardDef?.name}»!`;
+            setRaceFlash({
+              text: flashTitle,
+              subtext: cardDef?.durationSec ? `الخصم متأثر لمدة ${cardDef.durationSec} ثانية — أسرع بصيد الكلمات!` : 'ضربة موفقة 🔥',
+              isMine: true
+            });
+            setKuwaitiMsg(flashTitle);
+            setCommentType('praise');
+          }
         }
       } catch (err) {
         console.error('Online game message error:', err);
@@ -209,10 +333,33 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
     return () => socket.removeEventListener('message', handleMessage);
   }, [socket, playerId, categoryObj.name]);
 
-  // Clear flash banner after 2.2 seconds
+  // Countdown timers for active Battle Card debuffs & cooldown
+  useEffect(() => {
+    if (
+      myFrozenSeconds <= 0 &&
+      mySandstormSeconds <= 0 &&
+      myBlindWordsSeconds <= 0 &&
+      cardCooldown <= 0 &&
+      (!oppDebuffBanner || oppDebuffBanner.seconds <= 0)
+    ) {
+      return;
+    }
+    const timer = setInterval(() => {
+      setMyFrozenSeconds(s => Math.max(0, s - 1));
+      setMySandstormSeconds(s => Math.max(0, s - 1));
+      setMyBlindWordsSeconds(s => Math.max(0, s - 1));
+      setCardCooldown(s => Math.max(0, s - 1));
+      setOppDebuffBanner(prev =>
+        prev && prev.seconds > 1 ? { ...prev, seconds: prev.seconds - 1 } : null
+      );
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [myFrozenSeconds, mySandstormSeconds, myBlindWordsSeconds, cardCooldown, oppDebuffBanner]);
+
+  // Clear flash banner after 2.6 seconds
   useEffect(() => {
     if (!raceFlash) return;
-    const timer = setTimeout(() => setRaceFlash(null), 2200);
+    const timer = setTimeout(() => setRaceFlash(null), 2600);
     return () => clearTimeout(timer);
   }, [raceFlash]);
 
@@ -420,9 +567,77 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
           }
           return updated;
         });
+      } else if (type === 'BATTLE_CARD_USED') {
+        const { cardId, senderName, blockedByShield, stolenAmount } = payload || {};
+        const cardDef = BATTLE_CARD_ITEMS.find(c => c.id === cardId);
+
+        if (cardId === 'CARD_SHIELD') {
+          setOppShieldActive(true);
+          setKuwaitiMsg(`🛡️ الخصم «${senderName}» فعّل درع الحماية!`);
+          return;
+        }
+
+        if (myShieldActive) {
+          setMyShieldActive(false);
+          sounds.playVictory();
+          setRaceFlash({
+            text: `🛡️ درعك صدّ كرت «${cardDef?.shortName || 'الهجوم'}» من الخصم!`,
+            subtext: 'تم إحباط الهجوم بنجاح 🔥',
+            isMine: true
+          });
+          realtimeSync.publishToRoom(
+            room.code,
+            'BATTLE_CARD_BLOCKED',
+            { cardId, blockerId: playerId, blockerName: myPlayer?.displayName || 'الخصم' },
+            playerId
+          );
+          return;
+        }
+
+        if (!blockedByShield) {
+          sounds.playError();
+          const effectSeconds = cardDef?.durationSec || 15;
+          if (cardId === 'CARD_FREEZE_OPPONENT') setMyFrozenSeconds(effectSeconds);
+          if (cardId === 'CARD_SANDSTORM') setMySandstormSeconds(effectSeconds);
+          if (cardId === 'CARD_BLIND_WORDS') setMyBlindWordsSeconds(effectSeconds);
+          if (cardId === 'CARD_STEAL_POINTS') {
+            const amt = Number(stolenAmount) || 100;
+            setRoom(cur => {
+              const myP = cur.players[playerId];
+              const oppKey = Object.keys(cur.players).find(k => k !== playerId);
+              const oppP = oppKey ? cur.players[oppKey] : undefined;
+              const actual = Math.min(amt, myP?.score || 0);
+              return {
+                ...cur,
+                players: {
+                  ...cur.players,
+                  ...(myP ? { [playerId]: { ...myP, score: Math.max(0, (myP.score || 0) - actual) } } : {}),
+                  ...(oppKey && oppP ? { [oppKey]: { ...oppP, score: (oppP.score || 0) + actual } } : {})
+                }
+              };
+            });
+          }
+          setRaceFlash({
+            text: `${cardDef?.icon || '⚔️'} الخصم «${senderName}» أطلق عليك: ${cardDef?.name}!`,
+            subtext: cardDef?.durationSec ? `التأثير مستمر لمدة ${cardDef.durationSec} ثانية` : 'أسرع للتعويض!',
+            isMine: false
+          });
+          setKuwaitiMsg(`${cardDef?.icon || '⚔️'} الخصم استخدم عليك ${cardDef?.name}!`);
+          setCommentType('mistake');
+        }
+      } else if (type === 'BATTLE_CARD_BLOCKED') {
+        const { cardId } = payload || {};
+        const cardDef = BATTLE_CARD_ITEMS.find(c => c.id === cardId);
+        setOppShieldActive(false);
+        setOppDebuffBanner(null);
+        setRaceFlash({
+          text: `🛡️ درع الخصم صدّ كرت «${cardDef?.shortName || 'الهجوم'}»!`,
+          subtext: 'حاول مرة أخرى لكسر دفاعه',
+          isMine: false
+        });
       }
     });
-  }, [room.code, playerId, myPlayer, room.players]);
+  }, [room.code, playerId, myPlayer, room.players, myShieldActive]);
 
   // Offline simulated rival ONLY if opponent is a generated bot (starts with 'bot_')
   useEffect(() => {
@@ -524,6 +739,123 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
     }
   };
 
+  // Trigger an Online Battle Card (affecting the opponent or activating Shield)
+  const handleUseBattleCard = (cardId: BattleCardId) => {
+    if (gameFinished || cardCooldown > 0) return;
+    const ownedCount = currentUser?.battleCards?.[cardId] || 0;
+    const cardDef = BATTLE_CARD_ITEMS.find(c => c.id === cardId);
+    if (!cardDef) return;
+
+    if (ownedCount <= 0) {
+      sounds.playError();
+      setShowStoreModal(true);
+      return;
+    }
+
+    // Deduct 1 card from inventory
+    if (currentUser && onUpdateUser) {
+      const nextCards = {
+        ...(currentUser.battleCards || {}),
+        [cardId]: Math.max(0, ownedCount - 1)
+      };
+      const updated = saveUserToLocalMap({
+        ...currentUser,
+        battleCards: nextCards
+      });
+      onUpdateUser(updated);
+      syncProfileWithSupabase(updated);
+    }
+
+    setCardCooldown(4);
+
+    if (socket.readyState === WebSocket.OPEN) {
+      socket.send(
+        JSON.stringify({
+          type: 'USE_BATTLE_CARD',
+          payload: {
+            code: room.code,
+            cardId,
+            playerId
+          }
+        })
+      );
+    } else {
+      // Static / cloud relay fallback
+      if (cardId === 'CARD_SHIELD') {
+        sounds.playHint();
+        setMyShieldActive(true);
+        setKuwaitiMsg('🛡️ فعّلت درع الحماية! سيتم صد كرت الهجوم القادم تلقائياً.');
+        setCommentType('praise');
+        realtimeSync.publishToRoom(
+          room.code,
+          'BATTLE_CARD_USED',
+          { cardId, playerId, senderName: myPlayer?.displayName || 'الخصم' },
+          playerId
+        );
+        return;
+      }
+
+      if (oppShieldActive) {
+        setOppShieldActive(false);
+        sounds.playError();
+        setRaceFlash({
+          text: `🛡️ درع الخصم صدّ كرت «${cardDef.shortName}»!`,
+          subtext: 'تم كسر درع الخصم الآن',
+          isMine: false
+        });
+        return;
+      }
+
+      sounds.playVictory();
+      let stolenAmount = 0;
+      if (cardId === 'CARD_STEAL_POINTS' && opponent) {
+        stolenAmount = Math.min(100, Math.max(0, opponent.score || 0));
+        setRoom(cur => {
+          const myP = cur.players[playerId];
+          const oppP = cur.players[opponent.id];
+          return {
+            ...cur,
+            players: {
+              ...cur.players,
+              ...(myP ? { [playerId]: { ...myP, score: (myP.score || 0) + stolenAmount } } : {}),
+              ...(oppP ? { [opponent.id]: { ...oppP, score: Math.max(0, (oppP.score || 0) - stolenAmount) } } : {})
+            }
+          };
+        });
+      }
+
+      if (cardDef.durationSec) {
+        setOppDebuffBanner({
+          label: `${cardDef.icon} الخصم متأثر بـ ${cardDef.shortName}`,
+          seconds: cardDef.durationSec
+        });
+      }
+
+      setRaceFlash({
+        text:
+          cardId === 'CARD_STEAL_POINTS'
+            ? `⚡ سرقت +${stolenAmount} نقطة من الخصم!`
+            : `${cardDef.icon} أصبت الخصم بـ «${cardDef.name}»!`,
+        subtext: cardDef.durationSec ? `التأثير مستمر ${cardDef.durationSec} ثانية — اسبق الآن!` : 'ضربة قوية 🔥',
+        isMine: true
+      });
+      setKuwaitiMsg(`${cardDef.icon} أرسلت كرت «${cardDef.name}» على الخصم!`);
+      setCommentType('praise');
+
+      realtimeSync.publishToRoom(
+        room.code,
+        'BATTLE_CARD_USED',
+        {
+          cardId,
+          playerId,
+          senderName: myPlayer?.displayName || 'الخصم',
+          stolenAmount
+        },
+        playerId
+      );
+    }
+  };
+
   const totalWords = room.wordPlacements?.length || 7;
   const myWordsList = myPlayer?.wordsFound || [];
   const oppWordsList = opponent?.wordsFound || [];
@@ -610,14 +942,21 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
                 />
                 <div className="text-right flex-1 min-w-0">
                   <div className="flex items-center justify-between gap-1">
-                    <span className="text-xs font-black text-sky-400 truncate">
+                    <span className={`text-xs font-black truncate ${getNameGlowClass(currentUser?.equippedNameGlow)}`}>
                       أنت ({myPlayer.displayName})
                     </span>
-                    {(myPlayer.roundWins || 0) > 0 && (
-                      <span className="text-[10px] font-black px-1.5 py-0.5 rounded bg-amber-400/20 text-amber-300">
-                        🏆 {myPlayer.roundWins}
-                      </span>
-                    )}
+                    <div className="flex items-center gap-1">
+                      {myShieldActive && (
+                        <span className="text-[10px] font-black px-1.5 py-0.5 rounded bg-emerald-500/20 border border-emerald-400/50 text-emerald-300">
+                          🛡️ محمي
+                        </span>
+                      )}
+                      {(myPlayer.roundWins || 0) > 0 && (
+                        <span className="text-[10px] font-black px-1.5 py-0.5 rounded bg-amber-400/20 text-amber-300">
+                          🏆 {myPlayer.roundWins}
+                        </span>
+                      )}
+                    </div>
                   </div>
                   <div className="flex items-center justify-between mt-1">
                     <div className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-lg bg-sky-500/20 border border-sky-400/40 text-sky-200 text-xs font-black">
@@ -667,11 +1006,23 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
                     <span className="text-xs font-black text-pink-400 truncate">
                       الخصم ({opponent.displayName})
                     </span>
-                    {(opponent.roundWins || 0) > 0 && (
-                      <span className="text-[10px] font-black px-1.5 py-0.5 rounded bg-amber-400/20 text-amber-300">
-                        🏆 {opponent.roundWins}
-                      </span>
-                    )}
+                    <div className="flex items-center gap-1">
+                      {oppShieldActive && (
+                        <span className="text-[10px] font-black px-1.5 py-0.5 rounded bg-emerald-500/20 border border-emerald-400/50 text-emerald-300">
+                          🛡️ محمي
+                        </span>
+                      )}
+                      {oppDebuffBanner && (
+                        <span className="text-[10px] font-black px-1.5 py-0.5 rounded bg-amber-500/25 border border-amber-400/60 text-amber-200 animate-pulse">
+                          {oppDebuffBanner.label} ({oppDebuffBanner.seconds}ث)
+                        </span>
+                      )}
+                      {(opponent.roundWins || 0) > 0 && (
+                        <span className="text-[10px] font-black px-1.5 py-0.5 rounded bg-amber-400/20 text-amber-300">
+                          🏆 {opponent.roundWins}
+                        </span>
+                      )}
+                    </div>
                   </div>
                   <div className="flex items-center justify-between mt-1">
                     <div className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-lg bg-pink-500/20 border border-pink-400/40 text-pink-200 text-xs font-black">
@@ -759,7 +1110,7 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
       {/* Kuwaiti Commentary / Reaction Live Feed */}
       <KuwaitiCommentary message={kuwaitiMsg} type={commentType} />
 
-      {/* Target Word Bank with Ownership Badges */}
+      {/* Target Word Bank with Ownership Badges & Blind-Words Card Support */}
       <WordBank
         wordPlacements={room.wordPlacements}
         foundWords={foundWords}
@@ -768,9 +1119,85 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
         playerIdsMap={wordPlayerIdMap}
         currentPlayerId={playerId}
         currentPlayerName={myPlayer?.displayName}
+        maskUnfoundWords={myBlindWordsSeconds > 0}
+        maskedSeconds={myBlindWordsSeconds}
       />
 
-      {/* Game Board with Live Opponent Selection Cursor */}
+      {/* Online Battle Action Cards Bar (كروت التأثير على الخصم والدفاع) */}
+      <div
+        className="rounded-2xl p-2.5 sm:p-3 border border-amber-400/45 shadow-lg flex flex-col sm:flex-row sm:items-center justify-between gap-2"
+        style={{
+          background: 'linear-gradient(180deg, rgba(11, 32, 54, 0.94) 0%, rgba(5, 16, 28, 0.98) 100%)'
+        }}
+      >
+        <div className="flex items-center justify-between gap-2 shrink-0">
+          <div className="flex items-center gap-1.5 text-xs font-black text-amber-300">
+            <Shield className="w-4 h-4 text-amber-400" />
+            <span>كروت التحدي الأونلاين:</span>
+            {cardCooldown > 0 && (
+              <span className="px-2 py-0.5 rounded-full bg-slate-800 text-cyan-300 font-mono text-[10px]">
+                انتظار {cardCooldown}ث
+              </span>
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              sounds.playTap();
+              setShowStoreModal(true);
+            }}
+            className="sm:hidden px-2.5 py-1 rounded-xl bg-amber-400/20 border border-amber-400/50 text-amber-200 text-[10px] font-black flex items-center gap-1"
+          >
+            <ShoppingBag className="w-3 h-3" />
+            <span>شراء كروت</span>
+          </button>
+        </div>
+
+        <div className="flex items-center gap-1.5 overflow-x-auto py-0.5 flex-1">
+          {BATTLE_CARD_ITEMS.map(card => {
+            const count = currentUser?.battleCards?.[card.id] ?? 0;
+            const disabled = cardCooldown > 0;
+            return (
+              <button
+                key={card.id}
+                type="button"
+                disabled={disabled}
+                onClick={() => handleUseBattleCard(card.id)}
+                className={`px-2.5 py-1.5 rounded-xl border text-[11px] font-black flex items-center gap-1.5 shrink-0 transition-all cursor-pointer active:scale-95 ${
+                  count > 0
+                    ? 'bg-[#0b2a44] hover:bg-[#133d60] text-white border-cyan-400/50 hover:border-amber-400'
+                    : 'bg-slate-900/80 text-slate-400 border-slate-700 hover:border-amber-400/50'
+                } ${disabled ? 'opacity-55 cursor-not-allowed' : ''}`}
+                title={card.description}
+              >
+                <span className="text-sm">{card.icon}</span>
+                <span>{card.shortName}</span>
+                <span
+                  className={`px-1.5 py-0.2 rounded-full font-mono text-[10px] ${
+                    count > 0 ? 'bg-amber-400 text-slate-950' : 'bg-slate-800 text-amber-300'
+                  }`}
+                >
+                  {count > 0 ? `×${count}` : 'متجر'}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+
+        <button
+          type="button"
+          onClick={() => {
+            sounds.playTap();
+            setShowStoreModal(true);
+          }}
+          className="hidden sm:flex px-3 py-1.5 rounded-xl bg-amber-400/15 hover:bg-amber-400/25 border border-amber-400/50 text-amber-200 text-[11px] font-black items-center gap-1 shrink-0 cursor-pointer"
+        >
+          <ShoppingBag className="w-3.5 h-3.5" />
+          <span>شراء كروت</span>
+        </button>
+      </div>
+
+      {/* Game Board with Live Opponent Selection Cursor & Active Battle Card Effects */}
       <div className="flex justify-center py-1">
         <GameBoard
           grid={room.grid}
@@ -783,11 +1210,15 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
           opponentName={opponent?.displayName}
           onSelectionDrag={handleSelectionDrag}
           onWordSelected={handleWordSelected}
+          boardThemeId={currentUser?.equippedBoardTheme}
+          trailStyleId={currentUser?.equippedTrail}
+          frozenSeconds={myFrozenSeconds}
+          sandstormSeconds={mySandstormSeconds}
           tvMode={tvMode}
         />
       </div>
 
-      {/* Quick Reaction Buttons */}
+      {/* Quick Reaction Buttons (Including Unlocked Emote Packs) */}
       <div className="flex items-center justify-center gap-2 flex-wrap py-1">
         <span className="text-xs text-slate-400 font-bold ml-1">تفاعل مباشر:</span>
         {QUICK_REACTIONS.map(reaction => (
@@ -800,6 +1231,14 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
           </button>
         ))}
       </div>
+
+      <StoreModal
+        isOpen={showStoreModal}
+        onClose={() => setShowStoreModal(false)}
+        user={currentUser}
+        onUpdateUser={onUpdateUser}
+        initialTab="CARDS"
+      />
 
       {/* Game Finished Winner Modal using Kuwait Neon Victory Screen Design */}
       {gameFinished && winnerInfo && (

@@ -9,9 +9,13 @@ import {
   Settings,
   Bell,
   Plus,
-  Search
+  Search,
+  Users,
+  Globe,
+  Crown
 } from 'lucide-react';
 import { sounds } from '../utils/audio';
+import { getAllKnownPlayers } from '../services/supabaseClient';
 
 interface LeaderboardEntry {
   username: string;
@@ -20,6 +24,8 @@ interface LeaderboardEntry {
   xp: number;
   wins: number;
   stars: number;
+  title?: string;
+  wordsFound?: number;
 }
 
 interface LeaderboardScreenProps {
@@ -34,63 +40,83 @@ export const LeaderboardScreen: React.FC<LeaderboardScreenProps> = ({
   onBack
 }) => {
   const [leaderboard, setLeaderboard] = useState<LeaderboardEntry[]>([]);
+  const [boardTab, setBoardTab] = useState<'GLOBAL' | 'FRIENDS'>('GLOBAL');
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     const fetchLeaderboard = async () => {
+      setLoading(true);
       try {
-        const res = await fetch('/api/leaderboard');
-        const data = await res.json();
-        if (data.success && Array.isArray(data.leaderboard)) {
-          setLeaderboard(data.leaderboard);
-        }
-      } catch (err) {
-        console.error('Leaderboard fetch err:', err);
+        const allPlayers = await getAllKnownPlayers(user);
+        const entries: LeaderboardEntry[] = allPlayers.map(p => {
+          const starsCount = Object.values(p.completedLevels || {}).reduce(
+            (sum, lvl) => sum + (lvl.stars || 0),
+            0
+          );
+          return {
+            username: p.username,
+            displayName: p.displayName,
+            avatar: p.avatar || '/assets/images/avatar_kuwaiti_boy_1794404782928.jpg',
+            xp: p.xp || 0,
+            wins: (p.multiplayerWins || 0) + Object.keys(p.completedLevels || {}).length,
+            stars: starsCount,
+            title: p.selectedTitle || 'مستكشف الحروف',
+            wordsFound: p.totalWordsFound || Object.keys(p.completedLevels || {}).length * 6
+          };
+        });
+        setLeaderboard(entries.sort((a, b) => b.xp - a.xp));
+      } catch {
+        // ignore
       } finally {
         setLoading(false);
       }
     };
 
     fetchLeaderboard();
-  }, []);
+  }, [user]);
 
-  // Ensure we always have at least 3 podium entries even if fresh DB has 2 users
+  // Filter for Global vs Friends leaderboard without fake demo accounts
   const paddedPodium: LeaderboardEntry[] = React.useMemo(() => {
-    const list = [...leaderboard];
-    const defaults: LeaderboardEntry[] = [
-      {
-        username: user?.username || 'guest_981',
-        displayName: user?.displayName || 'ضيف فتشها # 981',
-        avatar: user?.avatar || '/assets/images/login_kuwaiti_mascot_1794483388654.jpg',
-        xp: user?.xp ?? 350,
-        wins: user?.multiplayerWins ?? 0,
-        stars: 3
-      },
-      {
-        username: 'ahmad_kwt',
-        displayName: 'أحمد الكندري',
-        avatar: '/assets/images/avatar_kuwaiti_boy_1794404782928.jpg',
-        xp: 0,
-        wins: 0,
-        stars: 0
-      },
-      {
-        username: 'dana_q8',
-        displayName: 'دانة المبارك',
-        avatar: '/assets/images/avatar_kuwaiti_girl_1794404783186.jpg',
-        xp: 0,
-        wins: 0,
-        stars: 0
-      }
-    ];
-    for (const d of defaults) {
-      if (list.length >= 3) break;
-      if (!list.some(item => item.username === d.username)) {
-        list.push(d);
-      }
+    const myEntry: LeaderboardEntry = {
+      username: user?.username || 'player_me',
+      displayName: user?.displayName || 'لاعب فتّشها',
+      avatar: user?.avatar || '/assets/images/login_kuwaiti_mascot_1794483388654.jpg',
+      xp: user?.xp ?? 0,
+      wins: (user?.multiplayerWins ?? 0) + Object.keys(user?.completedLevels || {}).length,
+      stars: Object.values(user?.completedLevels || {}).reduce((s, l) => s + (l.stars || 0), 0),
+      title: user?.selectedTitle || 'مستكشف الحروف',
+      wordsFound: user?.totalWordsFound || 0
+    };
+
+    if (boardTab === 'FRIENDS') {
+      const friendNames = (user?.friends || []).map(f => String(f).toLowerCase());
+      const friendEntries: LeaderboardEntry[] = friendNames.map(fName => {
+        const matched = leaderboard.find(l => l.username.toLowerCase() === fName);
+        if (matched) return matched;
+        return {
+          username: fName,
+          displayName: fName,
+          avatar: '/assets/images/avatar_kuwaiti_boy_1794404782928.jpg',
+          xp: 350,
+          wins: 2,
+          stars: 6,
+          title: 'صائد الكلمات',
+          wordsFound: 24
+        };
+      });
+      const combined = [
+        myEntry,
+        ...friendEntries.filter(f => f.username.toLowerCase() !== myEntry.username.toLowerCase())
+      ];
+      return combined.sort((a, b) => b.xp - a.xp);
     }
-    return list;
-  }, [leaderboard, user]);
+
+    const list = [...leaderboard];
+    if (!list.some(item => item.username.toLowerCase() === myEntry.username.toLowerCase())) {
+      list.push(myEntry);
+    }
+    return list.sort((a, b) => b.xp - a.xp);
+  }, [leaderboard, user, boardTab]);
 
   const firstPlace = paddedPodium[0];
   const secondPlace = paddedPodium[1];
@@ -453,7 +479,7 @@ export const LeaderboardScreen: React.FC<LeaderboardScreenProps> = ({
               </h1>
             </div>
 
-            {/* Left Laurel Wreath SVG */}
+              {/* Left Laurel Wreath SVG */}
             <svg viewBox="0 0 60 60" className="w-12 h-12 sm:w-14 sm:h-14 -mr-4 text-amber-400 fill-current drop-shadow scale-x-[-1]">
               <path d="M45,52 C25,45 15,28 22,8 C26,18 30,28 45,35 Z" opacity="0.85" />
               <circle cx="24" cy="14" r="3.5" />
@@ -461,6 +487,41 @@ export const LeaderboardScreen: React.FC<LeaderboardScreenProps> = ({
               <circle cx="22" cy="35" r="4" />
               <circle cx="29" cy="44" r="4" />
             </svg>
+          </div>
+
+          {/* Toggle Tabs: لوحة صدارة عامة vs لوحة صدارة للأصدقاء */}
+          <div className="mt-3 flex items-center gap-2 bg-[#061c2e]/95 p-1.5 rounded-2xl border border-cyan-400/45 shadow-lg">
+            <button
+              type="button"
+              onClick={() => {
+                sounds.playTap();
+                setBoardTab('GLOBAL');
+              }}
+              className={`px-4 py-1.5 rounded-xl text-xs sm:text-sm font-black flex items-center gap-1.5 cursor-pointer transition-all ${
+                boardTab === 'GLOBAL'
+                  ? 'bg-gradient-to-b from-amber-300 to-amber-500 text-slate-950 shadow'
+                  : 'text-slate-300 hover:text-white'
+              }`}
+            >
+              <Globe className="w-4 h-4" />
+              <span>لوحة صدارة عامة</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                sounds.playTap();
+                setBoardTab('FRIENDS');
+              }}
+              className={`px-4 py-1.5 rounded-xl text-xs sm:text-sm font-black flex items-center gap-1.5 cursor-pointer transition-all ${
+                boardTab === 'FRIENDS'
+                  ? 'bg-gradient-to-b from-[#a3e635] to-[#65a30d] text-slate-950 shadow'
+                  : 'text-slate-300 hover:text-white'
+              }`}
+            >
+              <Users className="w-4 h-4" />
+              <span>لوحة صدارة للأصدقاء ({(user?.friends?.length || 0) + 1})</span>
+            </button>
           </div>
         </div>
 
@@ -663,9 +724,17 @@ export const LeaderboardScreen: React.FC<LeaderboardScreenProps> = ({
                     />
 
                     <div className="text-right">
-                      <h4 className="text-sm sm:text-base font-black text-white">
-                        {player.displayName}
-                      </h4>
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <h4 className="text-sm sm:text-base font-black text-white">
+                          {player.displayName}
+                        </h4>
+                        {player.title && (
+                          <span className="px-2 py-0.2 rounded-full bg-amber-400/20 border border-amber-400/50 text-amber-300 text-[10px] font-black flex items-center gap-1">
+                            <Crown className="w-3 h-3" />
+                            <span>{player.title}</span>
+                          </span>
+                        )}
+                      </div>
                       <span className="text-xs font-mono text-slate-400 block" dir="ltr">
                         {player.username.startsWith('guest_')
                           ? player.username
