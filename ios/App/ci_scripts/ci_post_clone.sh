@@ -13,6 +13,6 @@ npm install
 npm run build
 npx cap sync ios
 
-cd "$CI_PRIMARY_REPOSITORY_PATH/ios/App"
 NEW_BUILD=$((CI_BUILD_NUMBER + 10))
-agvtool new-version -all "$NEW_BUILD"
+sed -i '' "s/CURRENT_PROJECT_VERSION = [0-9]*;/CURRENT_PROJECT_VERSION = $NEW_BUILD;/g" "$CI_PRIMARY_REPOSITORY_PATH/ios/App/App.xcodeproj/project.pbxproj"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $NEW_BUILD" "$CI_PRIMARY_REPOSITORY_PATH/ios/App/App/Info.plist" 2>/dev/null || true
