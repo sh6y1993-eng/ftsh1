@@ -14,5 +14,5 @@ npm run build
 npx cap sync ios
 
 cd "$CI_PRIMARY_REPOSITORY_PATH/ios/App"
-NEW_BUILD=$((CI_BUILD_NUMBER + 1))
+NEW_BUILD=$((CI_BUILD_NUMBER + 10))
 agvtool new-version -all "$NEW_BUILD"
