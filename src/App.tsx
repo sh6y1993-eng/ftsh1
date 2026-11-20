@@ -43,6 +43,8 @@ import {
   supabase,
   createQuickProfileFromSupabaseUser,
   buildProfileFromSupabaseUser,
+  fetchCloudProfileFromSupabase,
+  mergePlayerProfiles,
   logoutCurrentAccount
 } from './services/supabaseClient';
 
@@ -329,18 +331,32 @@ export default function App() {
           }
           return;
         }
+        const localFallback = getLocalUserProfile(savedUser);
         const storedToken = getStoredAuthToken(savedUser);
         if (storedToken) {
           const headers: Record<string, string> = { 'x-user-id': savedUser };
           const data = await safeApiJson<{ success?: boolean; user?: PlayerProfile }>('/api/auth/me', { headers });
           if (data?.success && data.user && !activeProfileRef.current) {
-            handleSelectActiveProfile(data.user);
+            const reconciled = localFallback ? mergePlayerProfiles(data.user, localFallback) : data.user;
+            handleSelectActiveProfile(reconciled);
             return;
           }
         }
-        const localFallback = getLocalUserProfile(savedUser);
         if (localFallback && !activeProfileRef.current) {
           handleSelectActiveProfile(localFallback);
+        }
+        // Reconcile cloud stages from Supabase in the background so switching devices or returning later never misses progress
+        const cloudProfile = await fetchCloudProfileFromSupabase(savedUser, localFallback?.email);
+        if (cloudProfile && isMounted) {
+          const current = activeProfileRef.current as PlayerProfile | null;
+          if (!current || current.username === cloudProfile.username) {
+            const merged = current
+              ? mergePlayerProfiles(current, cloudProfile)
+              : localFallback
+                ? mergePlayerProfiles(localFallback, cloudProfile)
+                : cloudProfile;
+            handleSelectActiveProfile(merged);
+          }
         }
       } catch {
         const localFallback = getLocalUserProfile();
@@ -582,10 +598,12 @@ export default function App() {
     const earnedXP = (50 + stars * 20 + Math.max(0, 100 - Math.floor(timeSpent))) * rewardMultiplier;
     const earnedCoins = (10 + stars * 5) * rewardMultiplier;
     if (activeProfile) {
+      const latestStored = getLocalUserProfile(activeProfile.username);
+      const baseProfile = latestStored ? mergePlayerProfiles(activeProfile, latestStored) : activeProfile;
       const levelKey = `${selectedCategory.id}_${selectedLevelInfo.levelNumber}`;
-      const existing = activeProfile.completedLevels?.[levelKey];
+      const existing = baseProfile.completedLevels?.[levelKey];
       const nextCompleted = {
-        ...(activeProfile.completedLevels || {}),
+        ...(baseProfile.completedLevels || {}),
         [levelKey]: {
           stars: Math.max(existing?.stars || 0, stars),
           bestTime: existing ? Math.min(existing.bestTime, timeSpent) : timeSpent,
@@ -594,19 +612,19 @@ export default function App() {
           completedAt: new Date().toISOString()
         }
       };
-      const nextXP = (activeProfile.xp || 0) + earnedXP;
-      const prevLevel = Math.floor((activeProfile.xp || 0) / 300) + 1;
+      const nextXP = (baseProfile.xp || 0) + earnedXP;
+      const prevLevel = Math.floor((baseProfile.xp || 0) / 300) + 1;
       const nextLevel = Math.floor(nextXP / 300) + 1;
       const updatedUser: PlayerProfile = saveUserToLocalMap({
-        ...activeProfile,
+        ...baseProfile,
         xp: nextXP,
-        seasonXp: (activeProfile.seasonXp || activeProfile.xp || 0) + earnedXP,
+        seasonXp: (baseProfile.seasonXp || baseProfile.xp || 0) + earnedXP,
         level: nextLevel,
-        coins: (activeProfile.coins || 0) + earnedCoins,
-        totalScore: (activeProfile.totalScore || 0) + score,
-        totalWordsFound: (activeProfile.totalWordsFound || 0) + wordsFoundCount,
-        fastStagesCount: (activeProfile.fastStagesCount || 0) + (timeSpent < 45 ? 1 : 0),
-        perfectStagesCount: (activeProfile.perfectStagesCount || 0) + (accuracy >= 100 ? 1 : 0),
+        coins: (baseProfile.coins || 0) + earnedCoins,
+        totalScore: (baseProfile.totalScore || 0) + score,
+        totalWordsFound: (baseProfile.totalWordsFound || 0) + wordsFoundCount,
+        fastStagesCount: (baseProfile.fastStagesCount || 0) + (timeSpent < 45 ? 1 : 0),
+        perfectStagesCount: (baseProfile.perfectStagesCount || 0) + (accuracy >= 100 ? 1 : 0),
         completedLevels: nextCompleted,
         completedLevelsCount: Object.keys(nextCompleted).length
       });

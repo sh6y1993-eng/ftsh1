@@ -19,6 +19,7 @@ interface GameBoardProps {
   opponentPath?: { row: number; col: number }[];
   opponentColor?: string;
   opponentName?: string;
+  opponentPaths?: { playerId: string; cells: { row: number; col: number }[]; color: string; name?: string }[];
   onSelectionDrag?: (cells: { row: number; col: number }[]) => void;
   onWordSelected: (word: string, cells: { row: number; col: number }[]) => void;
   onWordMistake?: () => void;
@@ -42,6 +43,7 @@ export const GameBoard: React.FC<GameBoardProps> = ({
   opponentPath = [],
   opponentColor = '#ec4899',
   opponentName,
+  opponentPaths = [],
   onSelectionDrag,
   onWordSelected,
   onWordMistake,
@@ -843,16 +845,41 @@ export const GameBoard: React.FC<GameBoardProps> = ({
     return currentPath.some(cell => cell.row === r && cell.col === c);
   };
 
-  // Is cell currently in opponent's live drag path?
-  const isInOpponentPath = (r: number, c: number) => {
-    return opponentPath.some(cell => cell.row === r && cell.col === c);
+  const effectiveOpponentPaths = React.useMemo(() => {
+    if (opponentPaths && opponentPaths.length > 0) {
+      return opponentPaths.filter(op => Array.isArray(op.cells) && op.cells.length > 0);
+    }
+    if (opponentPath && opponentPath.length > 0) {
+      return [{ playerId: 'opp', cells: opponentPath, color: opponentColor, name: opponentName }];
+    }
+    return [];
+  }, [opponentPaths, opponentPath, opponentColor, opponentName]);
+
+  // Is cell currently in any opponent's live drag path?
+  const getOpponentScanAt = (r: number, c: number) => {
+    for (const op of effectiveOpponentPaths) {
+      if (op.cells.some(cell => cell.row === r && cell.col === c)) {
+        return op;
+      }
+    }
+    return null;
+  };
+
+  const getOpponentLeadAt = (r: number, c: number) => {
+    for (const op of effectiveOpponentPaths) {
+      const last = op.cells[op.cells.length - 1];
+      if (last && last.row === r && last.col === c) {
+        return op;
+      }
+    }
+    return null;
   };
 
   // Determine cell classes & styles matching طاوله اللعب.png
   const getCellClasses = (r: number, c: number) => {
     const key = `${r},${c}`;
     const isSelected = isInCurrentPath(r, c);
-    const isOpponentScanning = isInOpponentPath(r, c);
+    const isOpponentScanning = Boolean(getOpponentScanAt(r, c));
     const isTvFocused = tvMode && tvFocus.row === r && tvFocus.col === c;
     const hintIdx = hintCellIndexMap.get(key);
     const isHint = hintIdx !== undefined;
@@ -887,7 +914,7 @@ export const GameBoard: React.FC<GameBoardProps> = ({
     }
 
     if (isOpponentScanning && !isSelected) {
-      base += 'ring-2 ring-pink-400/80 scale-[1.03] z-10 ';
+      base += 'scale-[1.03] z-10 ';
     }
 
     if (isTvFocused) {
@@ -1112,16 +1139,13 @@ export const GameBoard: React.FC<GameBoardProps> = ({
             const key = `${rIdx},${cIdx}`;
             const foundColor = cellColorMap.get(key);
             const isSelected = isInCurrentPath(rIdx, cIdx);
-            const isOpponentScanning = isInOpponentPath(rIdx, cIdx);
+            const opponentScan = getOpponentScanAt(rIdx, cIdx);
+            const opponentLead = getOpponentLeadAt(rIdx, cIdx);
             const hintIdx = hintCellIndexMap.get(key);
             const isHint = hintIdx !== undefined;
             const isHintStart = hintIdx === 0;
             const revealedBadge = revealedCellMap.get(key);
             const isRevealedHint = revealedBadge !== undefined;
-            const isOpponentLeadCell =
-              opponentPath.length > 0 &&
-              opponentPath[opponentPath.length - 1].row === rIdx &&
-              opponentPath[opponentPath.length - 1].col === cIdx;
             const isSandBlurred =
               isSandstormActive && !foundColor && !isSelected && (rIdx + cIdx) % 2 === 0;
 
@@ -1154,10 +1178,10 @@ export const GameBoard: React.FC<GameBoardProps> = ({
                 touchAction: 'none',
                 WebkitUserSelect: 'none'
               };
-            } else if (isOpponentScanning) {
+            } else if (opponentScan) {
               cellStyle = {
-                backgroundColor: `${opponentColor}40`,
-                border: `1.5px solid ${opponentColor}`,
+                backgroundColor: `${opponentScan.color}40`,
+                border: `1.5px solid ${opponentScan.color}`,
                 boxShadow: 'none',
                 touchAction: 'none',
                 WebkitUserSelect: 'none'
@@ -1245,12 +1269,12 @@ export const GameBoard: React.FC<GameBoardProps> = ({
                   </span>
                 )}
 
-                {isOpponentLeadCell && opponentName && (
+                {opponentLead && opponentLead.name && (
                   <span
                     className="pointer-events-none absolute -top-2.5 -right-2 px-1 py-0.2 rounded text-[8px] font-black text-white shadow-md whitespace-nowrap z-30"
-                    style={{ backgroundColor: opponentColor }}
+                    style={{ backgroundColor: opponentLead.color }}
                   >
-                    {opponentName.split(' ')[0]}
+                    {opponentLead.name.split(' ')[0]}
                   </span>
                 )}
               </div>

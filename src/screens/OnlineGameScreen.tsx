@@ -20,7 +20,13 @@ import { ResultsModal } from './ResultsModal';
 import { ArrowRight, AlertTriangle, Zap, Flame, Volume2, VolumeX, Shield, Timer, Eye, Flag, Ban } from 'lucide-react';
 import { sounds } from '../utils/audio';
 import confetti from 'canvas-confetti';
-import { realtimeSync } from '../services/realtimeSync';
+import {
+  realtimeSync,
+  normalizeRoomWordOwnership,
+  mergeCloudAndLocalRooms,
+  resolveCanonicalPlacementWord,
+  ONLINE_PLAYER_COLORS
+} from '../services/realtimeSync';
 import { apiFetch as fetch, getStoredAuthToken, saveUserToLocalMap, syncProfileWithSupabase } from '../services/supabaseClient';
 import { resolveWebSocketUrl } from '../utils/iosNative';
 
@@ -49,16 +55,23 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
   const [wordPlayerMap, setWordPlayerMap] = useState<Record<string, string>>({});
   const [wordPlayerNameMap, setWordPlayerNameMap] = useState<Record<string, string>>({});
   const [wordPlayerIdMap, setWordPlayerIdMap] = useState<Record<string, string>>({});
-  const [opponentPath, setOpponentPath] = useState<{ row: number; col: number }[]>([]);
+  const [opponentCursors, setOpponentCursors] = useState<
+    Record<string, { cells: { row: number; col: number }[]; expiresAt: number }>
+  >({});
   const [raceFlash, setRaceFlash] = useState<{
     text: string;
     subtext: string;
     isMine: boolean;
   } | null>(null);
+  const initialPlayerCount = Math.max(
+    2,
+    Object.keys(initialRoom.players || {}).length,
+    Number(initialRoom.maxPlayers) || 2
+  );
   const [kuwaitiMsg, setKuwaitiMsg] = useState(
     initialRoom.gameMode === 'SPEED_REVEAL_20S'
-      ? '⚡ مود التحدي الخاطف (20ث): لكل لاعب 20 ثانية يصيد كلمة، ولو خلص وقته ينكشف حرف سري عند خصمه فقط دون علمه!'
-      : 'نظام لاعبين (1 ضد 1): اللي يصيد الكلمة أول تنحسب له وتنصبغ بلونه قدام الخصم! 🔥'
+      ? '⚡ مود التحدي الخاطف (20ث): لكل لاعب 20 ثانية يصيد كلمة، ولو خلص وقته ينكشف حرف سري عند منافسيه دون علمه!'
+      : `نظام سباق ${initialPlayerCount} لاعبين: اللي يصيد الكلمة أول تنحسب له وتنصبغ بلونه قدام الجميع! 🔥`
   );
   const [commentType, setCommentType] = useState<'praise' | 'mistake' | 'neutral'>('neutral');
   const [disconnectionNotice, setDisconnectionNotice] = useState<string | null>(null);
@@ -91,8 +104,8 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
   const [mySandstormSeconds, setMySandstormSeconds] = useState(0);
   const [myBlindWordsSeconds, setMyBlindWordsSeconds] = useState(0);
   const [myShieldActive, setMyShieldActive] = useState(false);
-  const [oppDebuffBanner, setOppDebuffBanner] = useState<{ label: string; seconds: number } | null>(null);
-  const [oppShieldActive, setOppShieldActive] = useState(false);
+  const [oppShields, setOppShields] = useState<Record<string, boolean>>({});
+  const [oppDebuffs, setOppDebuffs] = useState<Record<string, { label: string; seconds: number }>>({});
   const [cardCooldown, setCardCooldown] = useState(0);
 
   const baseReactions = [
@@ -119,37 +132,58 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
     playersList.find(p => p.id === rawPlayerId) ||
     playersList[0];
   const playerId = myPlayer?.id || rawPlayerId;
-  const opponent = playersList.find(p => p.id !== playerId) || playersList[1];
+  const opponents = playersList.filter(p => String(p.id) !== String(playerId));
+  const opponent = opponents[0];
+  const getPlayerSeatColor = useCallback(
+    (pid: string, explicitColor?: string): string => {
+      if (explicitColor) return explicitColor;
+      const p = room.players?.[pid];
+      if (p?.color) return p.color;
+      const idx = playersList.findIndex(pl => String(pl.id) === String(pid));
+      return ONLINE_PLAYER_COLORS[(idx >= 0 ? idx : 0) % ONLINE_PLAYER_COLORS.length];
+    },
+    [room.players, playersList]
+  );
 
-  // Hydrate already-claimed words when joining or reconnecting to an in-progress match
+  // Keep foundWords and single-owner player maps continuously synchronized with authoritative room state
   useEffect(() => {
+    const normalized = normalizeRoomWordOwnership(room);
+    const claims = normalized.claimedWords || {};
     const allFound: string[] = [];
     const colorMap: Record<string, string> = {};
     const nameMap: Record<string, string> = {};
     const idMap: Record<string, string> = {};
 
-    Object.values(room.players || {}).forEach(p => {
-      (p.wordsFound || []).forEach(w => {
-        if (!allFound.includes(w)) allFound.push(w);
-        colorMap[w] = p.color || (p.id === playerId ? '#0ea5e9' : '#ec4899');
-        nameMap[w] = p.displayName;
-        idMap[w] = String(p.id);
-      });
+    Object.values(claims).forEach(claim => {
+      if (!claim || !claim.word) return;
+      if (!allFound.includes(claim.word)) {
+        allFound.push(claim.word);
+      }
+      const ownerP = normalized.players?.[claim.playerId];
+      colorMap[claim.word] =
+        claim.playerColor ||
+        ownerP?.color ||
+        (String(claim.playerId) === String(playerId) ? '#0ea5e9' : '#ec4899');
+      nameMap[claim.word] = claim.playerName || ownerP?.displayName || 'لاعب';
+      idMap[claim.word] = String(claim.playerId);
     });
 
-    if (allFound.length > 0) {
-      setFoundWords(allFound);
-      setWordPlayerMap(prev => ({ ...prev, ...colorMap }));
-      setWordPlayerNameMap(prev => ({ ...prev, ...nameMap }));
-      setWordPlayerIdMap(prev => ({ ...prev, ...idMap }));
-    }
-  }, [room.code]);
+    setFoundWords(allFound);
+    setWordPlayerMap(colorMap);
+    setWordPlayerNameMap(nameMap);
+    setWordPlayerIdMap(idMap);
+  }, [room, playerId]);
 
   const rematchFallbackTimerRef = React.useRef<number | null>(null);
   const roomRef = React.useRef<OnlineRoom>(room);
   roomRef.current = room;
   const foundWordsRef = React.useRef<string[]>(foundWords);
   foundWordsRef.current = foundWords;
+  const wordPlayerNameMapRef = React.useRef<Record<string, string>>(wordPlayerNameMap);
+  wordPlayerNameMapRef.current = wordPlayerNameMap;
+  const wordPlayerIdMapRef = React.useRef<Record<string, string>>(wordPlayerIdMap);
+  wordPlayerIdMapRef.current = wordPlayerIdMap;
+  const inFlightWordsRef = React.useRef<Set<string>>(new Set());
   const mySecretRevealedCellsRef = React.useRef(mySecretRevealedCells);
   mySecretRevealedCellsRef.current = mySecretRevealedCells;
   const playerDeadlinesRef = React.useRef(playerDeadlines);
@@ -320,13 +354,14 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
       }
 
       clearRematchTimer();
+      inFlightWordsRef.current.clear();
       sounds.playVictory();
-      setRoom(newRoom);
+      setRoom(normalizeRoomWordOwnership({ ...newRoom, claimedWords: newRoom.claimedWords || {} }));
       setFoundWords([]);
       setWordPlayerMap({});
       setWordPlayerNameMap({});
       setWordPlayerIdMap({});
-      setOpponentPath([]);
+      setOpponentCursors({});
       setRaceFlash(null);
       setGameFinished(false);
       setWinnerInfo(null);
@@ -336,8 +371,8 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
       setMySandstormSeconds(0);
       setMyBlindWordsSeconds(0);
       setMyShieldActive(false);
-      setOppShieldActive(false);
-      setOppDebuffBanner(null);
+      setOppShields({});
+      setOppDebuffs({});
       setMySecretRevealedCells(newRoom.myRevealedCells || []);
       if (newRoom.gameMode === 'SPEED_REVEAL_20S') {
         const now = Date.now();
@@ -443,36 +478,120 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
 
     socket.addEventListener('close', handleSocketClose);
 
+    const reconcileFromCloudAndServer = async (notifyCaughtWhileAway = false) => {
+      if (isUnmounted) return;
+      // 1. Try authoritative Express server first if connected/available
+      try {
+        const res = await fetch(`/api/rooms/${encodeURIComponent(room.code)}`);
+        const contentType = res.headers.get('content-type') || '';
+        if (res.ok && contentType.includes('application/json')) {
+          const data = await res.json();
+          if (data?.success && data.room) {
+            const normServer = normalizeRoomWordOwnership(data.room);
+            setRoom(normServer);
+            if (normServer.playerDeadlines) {
+              setPlayerDeadlines(normServer.playerDeadlines);
+            }
+            return;
+          }
+        }
+      } catch {
+        // Static / Vercel host fallback below
+      }
+
+      // 2. Reconcile from Supabase Cloud Room Snapshot store (critical when player returns to Safari on ftsh1.vercel.app)
+      const cloudSnap = await realtimeSync.fetchCloudRoomSnapshot(room.code);
+      if (!cloudSnap || isUnmounted) return;
+
+      const curRoom = roomRef.current;
+      const curRound = Number(curRoom.roundNumber) || 1;
+      const snapRound = Number(cloudSnap.roundNumber) || 1;
+
+      if (snapRound > curRound && cloudSnap.state === 'PLAYING') {
+        applyRematchStarted(cloudSnap, undefined, snapRound);
+        return;
+      }
+
+      if (snapRound === curRound) {
+        const prevClaimedSet = new Set(Object.keys(normalizeRoomWordOwnership(curRoom).claimedWords || {}));
+        const merged = mergeCloudAndLocalRooms(curRoom, cloudSnap);
+        const mergedClaims = merged.claimedWords || {};
+        const newlyCaughtByOpponent = Object.values(mergedClaims).filter(
+          c => !prevClaimedSet.has(c.word) && String(c.playerId) !== String(playerId)
+        );
+
+        let nextRoomState = merged;
+        const totalWordCount = merged.wordPlacements?.length || 7;
+        if (Object.keys(mergedClaims).length >= totalWordCount && merged.state !== 'FINISHED') {
+          nextRoomState = buildLocalStandingsAndFinish(merged);
+        }
+
+        if (
+          newlyCaughtByOpponent.length > 0 ||
+          Object.keys(mergedClaims).length !== prevClaimedSet.size ||
+          nextRoomState.state !== curRoom.state
+        ) {
+          setRoom(nextRoomState);
+          if (notifyCaughtWhileAway && newlyCaughtByOpponent.length > 0) {
+            const lastCatch = newlyCaughtByOpponent[newlyCaughtByOpponent.length - 1];
+            const shown = lastCatch.displayWord || lastCatch.word;
+            setKuwaitiMsg(
+              `⚡ الخصم «${lastCatch.playerName || 'المنافس'}» صاد كلمة «${shown}» أثناء خروجك وانحسبت له! اسبق على الكلمات المتبقية 🔥`
+            );
+            setCommentType('mistake');
+          }
+        }
+      }
+    };
+
     const handleResumeOrOnline = () => {
       sounds.resumeIfNeeded();
       ensureLiveSocket();
-      fetch(`/api/rooms/${encodeURIComponent(room.code)}`)
-        .then(r => (r.ok ? r.json() : null))
-        .then(data => {
-          if (data?.success && data.room) {
-            setRoom(data.room);
-            if (data.room.playerDeadlines) {
-              setPlayerDeadlines(data.room.playerDeadlines);
-            }
-          }
-        })
-        .catch(() => {});
+      void realtimeSync.reconnectRoomChannel(room.code).then(() => {
+        void realtimeSync.publishToRoom(
+          room.code,
+          'REQUEST_ROOM_SYNC',
+          { requesterId: playerId },
+          playerId
+        );
+      });
+      void reconcileFromCloudAndServer(true);
+    };
+
+    const handleVisibilityChange = () => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible') {
+        handleResumeOrOnline();
+      }
     };
 
     window.addEventListener('fatteshha:app-resumed', handleResumeOrOnline);
     window.addEventListener('online', handleResumeOrOnline);
+    window.addEventListener('focus', handleResumeOrOnline);
+    window.addEventListener('pageshow', handleResumeOrOnline);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    // Continuous 1.8s background cloud snapshot reconciliation so missed mobile packets self-heal automatically
+    const cloudPollTimer = window.setInterval(() => {
+      if (socket.readyState !== WebSocket.OPEN) {
+        void reconcileFromCloudAndServer(false);
+      }
+    }, 1800);
 
     return () => {
       isUnmounted = true;
       if (reconnectTimer !== null) {
         window.clearTimeout(reconnectTimer);
       }
+      window.clearInterval(cloudPollTimer);
       socket.removeEventListener('open', sendRejoin);
       socket.removeEventListener('close', handleSocketClose);
       window.removeEventListener('fatteshha:app-resumed', handleResumeOrOnline);
       window.removeEventListener('online', handleResumeOrOnline);
+      window.removeEventListener('focus', handleResumeOrOnline);
+      window.removeEventListener('pageshow', handleResumeOrOnline);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
-  }, [socket, room.code, playerId, currentUser?.username, getWsAuthToken]);
+  }, [socket, room.code, playerId, currentUser?.username, getWsAuthToken, applyRematchStarted, buildLocalStandingsAndFinish]);
 
   useEffect(() => {
     const handleMessage = (event: MessageEvent) => {
@@ -481,7 +600,20 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
         const { type, payload } = data;
 
         if (type === 'OPPONENT_CURSOR') {
-          setOpponentPath(payload.cells || []);
+          const cursorPid = String(payload?.playerId || opponent?.id || 'opponent');
+          const cells = Array.isArray(payload?.cells) ? payload.cells : [];
+          setOpponentCursors(prev => {
+            if (cells.length === 0) {
+              if (!prev[cursorPid]) return prev;
+              const copy = { ...prev };
+              delete copy[cursorPid];
+              return copy;
+            }
+            return {
+              ...prev,
+              [cursorPid]: { cells, expiresAt: Date.now() + 2600 }
+            };
+          });
         } else if (type === 'ROOM_REJOINED' && payload?.room) {
           setRoom(payload.room);
           if (payload.room.playerDeadlines) {
@@ -543,7 +675,13 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
           if (updatedRoom?.playerDeadlines) {
             setPlayerDeadlines(updatedRoom.playerDeadlines);
           }
-          setOpponentPath([]);
+          setOpponentCursors(prev => {
+            const cKey = String(claimerId);
+            if (!prev[cKey]) return prev;
+            const copy = { ...prev };
+            delete copy[cKey];
+            return copy;
+          });
 
           setFoundWords(prev => (prev.includes(word) ? prev : [...prev, word]));
           setWordPlayerMap(prev => ({ ...prev, [word]: resolvedColor }));
@@ -553,19 +691,23 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
           const shownWord = displayWord || word;
           const pts = wordScore || 150;
 
-          // Detect if this word catch flipped the match lead
+          // Detect if this word catch flipped the match lead across all 2-4 players
           const updatedPlayers = Object.values(updatedRoom.players || {}) as Array<{
             id: string;
             score: number;
           }>;
           const claimerUpdated = updatedPlayers.find(p => String(p.id) === String(claimerId));
-          const rivalUpdated = updatedPlayers.find(p => String(p.id) !== String(claimerId));
           const prevClaimerScore = (claimerUpdated?.score || pts) - pts;
-          const rivalScore = rivalUpdated?.score || 0;
+          const maxOtherScore = Math.max(
+            0,
+            ...updatedPlayers
+              .filter(p => String(p.id) !== String(claimerId))
+              .map(p => p.score || 0)
+          );
           const tookLead =
-            rivalScore > 0 &&
-            prevClaimerScore <= rivalScore &&
-            (claimerUpdated?.score || 0) > rivalScore;
+            maxOtherScore > 0 &&
+            prevClaimerScore <= maxOtherScore &&
+            (claimerUpdated?.score || 0) > maxOtherScore;
 
           if (isClaimedByMe) {
             sounds.playMultiplayerWordScore(streak || 1, 0);
@@ -598,9 +740,12 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
             });
           }
         } else if (type === 'WORD_ALREADY_CLAIMED') {
+          if (payload?.room) {
+            setRoom(normalizeRoomWordOwnership(payload.room));
+          }
           sounds.playError();
-          const claimer = payload.claimedByName || 'الخصم';
-          setKuwaitiMsg(`صادها ${claimer} قبلك بجزء من الثانية وانحسبت له! دوّر كلمة ثانية ⚡`);
+          const claimer = payload?.claimedByName || 'الخصم';
+          setKuwaitiMsg(`صادها «${claimer}» قبلك وانحسبت له! دوّر كلمة ثانية ⚡`);
           setCommentType('mistake');
         } else if (type === 'CHAT_BROADCAST') {
           const { chatItem } = payload || {};
@@ -615,7 +760,7 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
         } else if (type === 'GAME_FINISHED') {
           const { room: finalRoom, winnerId, winnerName, seriesCompleted, seriesWinnerId } = payload;
           setRoom(finalRoom);
-          setOpponentPath([]);
+          setOpponentCursors({});
           setGameFinished(true);
           setRematchLoading(false);
           setWinnerInfo({ id: winnerId, name: winnerName });
@@ -709,6 +854,9 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
             senderId,
             senderName,
             targetId,
+            targetIds,
+            blockedByIds,
+            targetName,
             blockedByShield,
             stolenAmount,
             room: updatedRoom
@@ -719,41 +867,63 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
 
           const cardDef = BATTLE_CARD_ITEMS.find(c => c.id === cardId);
           const isSenderMe = String(senderId) === String(playerId);
-          const isTargetMe = String(targetId) === String(playerId);
+          const resolvedTargetIds: string[] = Array.isArray(targetIds)
+            ? targetIds.map(String)
+            : targetId
+            ? [String(targetId)]
+            : [];
+          const resolvedBlockedIds: string[] = Array.isArray(blockedByIds)
+            ? blockedByIds.map(String)
+            : blockedByShield && targetId
+            ? [String(targetId)]
+            : [];
+          const isTargetMe = resolvedTargetIds.includes(String(playerId));
+          const isBlockedByMe = resolvedBlockedIds.includes(String(playerId));
 
           if (cardId === 'CARD_SHIELD') {
             sounds.playHint();
             if (isSenderMe) {
               setMyShieldActive(true);
-              setKuwaitiMsg('🛡️ فعّلت درع الحماية! سيتم صد كرت الهجوم القادم من خصمك تلقائياً.');
+              setKuwaitiMsg('🛡️ فعّلت درع الحماية! سيتم صد كرت الهجوم القادم من خصومك تلقائياً.');
               setCommentType('praise');
             } else {
-              setOppShieldActive(true);
-              setKuwaitiMsg(`🛡️ الخصم «${senderName}» فعّل درع الحماية ضد هجماتك!`);
+              setOppShields(prev => ({ ...prev, [String(senderId)]: true }));
+              setKuwaitiMsg(`🛡️ اللاعب «${senderName}» فعّل درع الحماية ضد الهجمات!`);
               setCommentType('neutral');
             }
             return;
           }
 
-          if (blockedByShield) {
-            sounds.playVictory();
-            if (isTargetMe) {
+          if (resolvedBlockedIds.length > 0) {
+            if (isBlockedByMe) {
               setMyShieldActive(false);
-              setRaceFlash({
-                text: `🛡️ درعك صدّ كرت «${cardDef?.shortName || 'الهجوم'}» من الخصم!`,
-                subtext: 'نجوت من التأثير بنجاح 🔥',
-                isMine: true
-              });
-              setKuwaitiMsg(`🛡️ درع الحماية صدّ هجوم الخصم (${cardDef?.name}) عنك!`);
-            } else {
-              setOppShieldActive(false);
-              setRaceFlash({
-                text: `🛡️ درع الخصم صدّ كرت «${cardDef?.shortName || 'الهجوم'}»!`,
-                subtext: 'حاول بكرت آخر لكسر دفاعه',
-                isMine: false
-              });
-              setKuwaitiMsg(`🛡️ الخصم كان محمياً بدرع وصدّ كرتك (${cardDef?.name})!`);
             }
+            setOppShields(prev => {
+              const next = { ...prev };
+              resolvedBlockedIds.forEach(bid => {
+                next[bid] = false;
+              });
+              return next;
+            });
+          }
+
+          if (isBlockedByMe && !isTargetMe) {
+            sounds.playVictory();
+            setRaceFlash({
+              text: `🛡️ درعك صدّ كرت «${cardDef?.shortName || 'الهجوم'}» من «${senderName}»!`,
+              subtext: 'نجوت من التأثير بنجاح 🔥',
+              isMine: true
+            });
+            setKuwaitiMsg(`🛡️ درع الحماية صدّ هجوم «${senderName}» (${cardDef?.name}) عنك!`);
+            if (resolvedTargetIds.length === 0) return;
+          } else if (isSenderMe && resolvedTargetIds.length === 0 && resolvedBlockedIds.length > 0) {
+            sounds.playVictory();
+            setRaceFlash({
+              text: `🛡️ الدروع صدّت كرت «${cardDef?.shortName || 'الهجوم'}»!`,
+              subtext: 'تم كسر درع المنافسين — حاول بكرت آخر',
+              isMine: false
+            });
+            setKuwaitiMsg(`🛡️ المنافسون كانوا محميين بالدروع وصدّوا كرتك (${cardDef?.name})!`);
             return;
           }
 
@@ -769,8 +939,8 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
             }
             const flashTitle =
               cardId === 'CARD_STEAL_POINTS'
-                ? `⚡ الخصم «${senderName}» سرق ${stolenAmount || 0} نقطة من رصيدك!`
-                : `${cardDef?.icon || '⚔️'} الخصم «${senderName}» أطلق عليك: ${cardDef?.name || 'كرت هجوم'}!`;
+                ? `⚡ «${senderName}» سرق ${stolenAmount || 0} نقطة من رصيدك!`
+                : `${cardDef?.icon || '⚔️'} «${senderName}» أطلق عليك: ${cardDef?.name || 'كرت هجوم'}!`;
             setRaceFlash({
               text: flashTitle,
               subtext: cardDef?.durationSec ? `التأثير مستمر لمدة ${cardDef.durationSec} ثانية` : 'انتزع الصدارة مجدداً!',
@@ -778,21 +948,29 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
             });
             setKuwaitiMsg(flashTitle);
             setCommentType('mistake');
-          } else if (isSenderMe) {
+          } else if (isSenderMe && resolvedTargetIds.length > 0) {
             sounds.playVictory();
             if (cardDef?.durationSec) {
-              setOppDebuffBanner({
-                label: `${cardDef.icon} الخصم متأثر بـ ${cardDef.shortName}`,
-                seconds: cardDef.durationSec
+              setOppDebuffs(prev => {
+                const next = { ...prev };
+                resolvedTargetIds.forEach(tid => {
+                  next[tid] = {
+                    label: `${cardDef.icon} ${cardDef.shortName}`,
+                    seconds: cardDef.durationSec!
+                  };
+                });
+                return next;
               });
             }
             const flashTitle =
               cardId === 'CARD_STEAL_POINTS'
-                ? `⚡ سرقت +${stolenAmount || 0} نقطة من الخصم وأضفتها لرصيدك!`
-                : `${cardDef?.icon || '⚔️'} أصبت الخصم بـ «${cardDef?.name}»!`;
+                ? `⚡ سرقت +${stolenAmount || 0} نقطة من «${targetName || 'المتصدر'}» وأضفتها لرصيدك!`
+                : resolvedTargetIds.length > 1
+                ? `${cardDef?.icon || '⚔️'} أصبت ${resolvedTargetIds.length} منافسين بـ «${cardDef?.name}»!`
+                : `${cardDef?.icon || '⚔️'} أصبت «${targetName || 'الخصم'}» بـ «${cardDef?.name}»!`;
             setRaceFlash({
               text: flashTitle,
-              subtext: cardDef?.durationSec ? `الخصم متأثر لمدة ${cardDef.durationSec} ثانية — أسرع بصيد الكلمات!` : 'ضربة موفقة 🔥',
+              subtext: cardDef?.durationSec ? `التأثير مستمر ${cardDef.durationSec} ثانية — أسرع بصيد الكلمات!` : 'ضربة موفقة 🔥',
               isMine: true
             });
             setKuwaitiMsg(flashTitle);
@@ -806,16 +984,17 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
 
     socket.addEventListener('message', handleMessage);
     return () => socket.removeEventListener('message', handleMessage);
-  }, [socket, playerId, categoryObj.name, applyRematchStarted, clearRematchTimer]);
+  }, [socket, playerId, categoryObj.name, applyRematchStarted, clearRematchTimer, opponent?.id]);
 
   // Countdown timers for active Battle Card debuffs & cooldown
   useEffect(() => {
+    const hasOppDebuff = Object.keys(oppDebuffs).length > 0;
     if (
       myFrozenSeconds <= 0 &&
       mySandstormSeconds <= 0 &&
       myBlindWordsSeconds <= 0 &&
       cardCooldown <= 0 &&
-      (!oppDebuffBanner || oppDebuffBanner.seconds <= 0)
+      !hasOppDebuff
     ) {
       return;
     }
@@ -824,12 +1003,18 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
       setMySandstormSeconds(s => Math.max(0, s - 1));
       setMyBlindWordsSeconds(s => Math.max(0, s - 1));
       setCardCooldown(s => Math.max(0, s - 1));
-      setOppDebuffBanner(prev =>
-        prev && prev.seconds > 1 ? { ...prev, seconds: prev.seconds - 1 } : null
-      );
+      setOppDebuffs(prev => {
+        const next: Record<string, { label: string; seconds: number }> = {};
+        Object.entries(prev).forEach(([pid, val]) => {
+          if (val.seconds > 1) {
+            next[pid] = { ...val, seconds: val.seconds - 1 };
+          }
+        });
+        return next;
+      });
     }, 1000);
     return () => clearInterval(timer);
-  }, [myFrozenSeconds, mySandstormSeconds, myBlindWordsSeconds, cardCooldown, oppDebuffBanner]);
+  }, [myFrozenSeconds, mySandstormSeconds, myBlindWordsSeconds, cardCooldown, oppDebuffs]);
 
   // Clear flash banner after 2.6 seconds
   useEffect(() => {
@@ -984,11 +1169,27 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
 
   // Handle word selection from the board
   const handleWordSelected = (word: string, selectedCells?: { row: number; col: number }[]) => {
-    if (foundWords.includes(word)) {
+    const curNormalized = normalizeRoomWordOwnership(roomRef.current);
+    const canonicalWord = resolveCanonicalPlacementWord(curNormalized, word);
+    const existingClaim = curNormalized.claimedWords?.[canonicalWord];
+
+    if (
+      foundWordsRef.current.includes(canonicalWord) ||
+      foundWords.includes(word) ||
+      Boolean(existingClaim)
+    ) {
       sounds.playError();
-      const ownerName = wordPlayerNameMap[word] || 'لاعب';
+      const ownerName =
+        existingClaim?.playerName ||
+        wordPlayerNameMapRef.current[canonicalWord] ||
+        wordPlayerNameMap[word] ||
+        'لاعب';
       setKuwaitiMsg(`هذه الكلمة صادها «${ownerName}» وانحسبت له! اسبق على الكلمات الباقية ⚡`);
       setCommentType('mistake');
+      return;
+    }
+
+    if (inFlightWordsRef.current.has(canonicalWord)) {
       return;
     }
 
@@ -997,7 +1198,7 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
         setRoom(prev => ({
           ...prev,
           wordPlacements: (prev.wordPlacements || []).map(wp =>
-            wp.word === word || normalizeArabicWord(wp.word) === normalizeArabicWord(word)
+            wp.word === canonicalWord || normalizeArabicWord(wp.word) === normalizeArabicWord(canonicalWord)
               ? { ...wp, cells: selectedCells }
               : wp
           )
@@ -1008,7 +1209,7 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
           type: 'WORD_FOUND',
           payload: {
             code: room.code,
-            word,
+            word: canonicalWord,
             playerId,
             username: currentUser?.username,
             authToken: currentUser?.authToken,
@@ -1017,144 +1218,155 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
         })
       );
     } else {
-      // Verify word claim through authoritative server endpoint first
+      // 1. Verify word claim through authoritative server endpoint first (if backend is active)
+      inFlightWordsRef.current.add(canonicalWord);
       (async () => {
         try {
-          const res = await fetch('/api/rooms/claim-word', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              code: room.code,
-              word,
-              playerId,
-              username: currentUser?.username,
-              cells: selectedCells
-            })
-          });
-          const data = await res.json();
-          if (res.ok && data?.success && data.room) {
-            const dataRoom = data.room;
-            const claimedCells = Array.isArray(data.cells) && data.cells.length >= 2 ? data.cells : selectedCells;
-            const mergedDataRoom = {
-              ...dataRoom,
-              wordPlacements: (dataRoom.wordPlacements || []).map((wp: any) => {
-                if (
-                  Array.isArray(claimedCells) &&
-                  claimedCells.length >= 2 &&
-                  (wp.word === word || normalizeArabicWord(wp.word) === normalizeArabicWord(word))
-                ) {
-                  return { ...wp, cells: claimedCells };
-                }
-                return wp;
-              })
-            };
-            setRoom(mergedDataRoom);
-            if (data.room.playerDeadlines) {
-              setPlayerDeadlines(data.room.playerDeadlines);
-            }
-            realtimeSync.publishToRoom(
-              room.code,
-              'WORD_FOUND',
-              {
-                word: data.word || word,
+          try {
+            const res = await fetch('/api/rooms/claim-word', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                code: room.code,
+                word: canonicalWord,
                 playerId,
-                playerName: myPlayer?.displayName || 'أنت',
-                playerColor: myPlayer?.color || (room.hostId === playerId ? '#0ea5e9' : '#ec4899'),
-                displayWord: data.displayWord || word,
-                wordScore: data.wordScore,
-                signature: data.signature,
-                cells: claimedCells
-              },
-              playerId
-            );
-            return;
+                username: currentUser?.username,
+                cells: selectedCells
+              })
+            });
+            const contentType = res.headers.get('content-type') || '';
+            if (res.status !== 404 && contentType.includes('application/json')) {
+              const data = await res.json();
+              if (res.ok && data?.success && data.room) {
+                const dataRoom = data.room;
+                const claimedCells =
+                  Array.isArray(data.cells) && data.cells.length >= 2 ? data.cells : selectedCells;
+                const mergedDataRoom = normalizeRoomWordOwnership({
+                  ...dataRoom,
+                  wordPlacements: (dataRoom.wordPlacements || []).map((wp: any) => {
+                    if (
+                      Array.isArray(claimedCells) &&
+                      claimedCells.length >= 2 &&
+                      (wp.word === canonicalWord ||
+                        normalizeArabicWord(wp.word) === normalizeArabicWord(canonicalWord))
+                    ) {
+                      return { ...wp, cells: claimedCells };
+                    }
+                    return wp;
+                  })
+                });
+                setRoom(mergedDataRoom);
+                if (data.room.playerDeadlines) {
+                  setPlayerDeadlines(data.room.playerDeadlines);
+                }
+                const claimedAt = Date.now();
+                void realtimeSync.saveCloudRoomSnapshot(mergedDataRoom, { skipMerge: true });
+                void realtimeSync.publishToRoom(
+                  room.code,
+                  'WORD_FOUND',
+                  {
+                    word: data.word || canonicalWord,
+                    playerId,
+                    playerName: myPlayer?.displayName || 'أنت',
+                    playerColor: myPlayer?.color || (room.hostId === playerId ? '#0ea5e9' : '#ec4899'),
+                    displayWord: data.displayWord || canonicalWord,
+                    wordScore: data.wordScore,
+                    signature: data.signature,
+                    cells: claimedCells,
+                    claimedAt,
+                    room: mergedDataRoom
+                  },
+                  playerId
+                );
+                return;
+              }
+
+              // Authoritative server explicitly rejected the claim (e.g., word was already claimed while player was away!)
+              if (data?.room) {
+                setRoom(normalizeRoomWordOwnership(data.room));
+              }
+              sounds.playError();
+              const claimerName =
+                data?.claimedByName ||
+                wordPlayerNameMapRef.current[canonicalWord] ||
+                opponent?.displayName ||
+                'الخصم';
+              setKuwaitiMsg(`هذه الكلمة صادها «${claimerName}» قبلك وانحسبت له! اسبق على الكلمات الباقية ⚡`);
+              setCommentType('mistake');
+              return;
+            }
+          } catch {
+            // Static host / Vercel fallback below
           }
-        } catch {
-          // Offline / static host fallback below
-        }
 
-        const placement = room.wordPlacements?.find(p => p.word === word);
-        if (!placement) return;
-        const displayWord = placement?.displayWord || word;
-        const pts = 150;
-        const myColor = myPlayer?.color || (room.hostId === playerId ? '#0ea5e9' : '#ec4899');
-        const myName = myPlayer?.displayName || 'أنت';
-        sounds.playMultiplayerWordScore(1, 0);
+          // 2. Static host / Vercel authoritative cloud claim via Supabase Cloud Room Snapshot store
+          const placement = (roomRef.current.wordPlacements || []).find(
+            p => p.word === canonicalWord || normalizeArabicWord(p.word) === normalizeArabicWord(canonicalWord)
+          );
+          if (!placement) return;
 
-        if (isSpeedMode) {
-          setPlayerDeadlines(prev => ({ ...prev, [playerId]: Date.now() + 20_000 }));
-        }
+          const displayWord = placement.displayWord || canonicalWord;
+          const pts = 150;
+          const myColor = myPlayer?.color || (room.hostId === playerId ? '#0ea5e9' : '#ec4899');
+          const myName = myPlayer?.displayName || 'أنت';
+          const claimTimestamp = Date.now();
 
-        // Publish word discovery over real-time cloud relay to the opponent
-        realtimeSync.publishToRoom(
-          room.code,
-          'WORD_FOUND',
-          {
-            word,
+          const claimResult = await realtimeSync.claimWordInCloudRoom({
+            room: roomRef.current,
+            word: canonicalWord,
+            displayWord,
             playerId,
             playerName: myName,
             playerColor: myColor,
-            displayWord,
-            cells: selectedCells
-          },
-          playerId
-        );
+            wordScore: pts,
+            cells: selectedCells,
+            claimedAt: claimTimestamp
+          });
 
-        setFoundWords(prev => (prev.includes(word) ? prev : [...prev, word]));
-        setWordPlayerMap(prev => ({ ...prev, [word]: myColor }));
-        setWordPlayerNameMap(prev => ({ ...prev, [word]: myName }));
-        setWordPlayerIdMap(prev => ({ ...prev, [word]: String(playerId) }));
-
-        setKuwaitiMsg(`كفو! صدت كلمة «${displayWord}» وانحسبت لك (+${pts} نقطة)! ⚡`);
-        setCommentType('praise');
-        setRaceFlash({
-          text: `🔊 ⚡ صدت «${displayWord}» أول! انحسبت لك`,
-          subtext: `+${pts} نقطة لصالحك`,
-          isMine: true
-        });
-
-        setRoom(prev => {
-          const myP = prev.players[playerId];
-          const currentFound = myP?.wordsFound || [];
-          if (currentFound.includes(word)) return prev;
-          const nextScore = (myP?.score || 0) + pts;
-          const nextTotalScore = (myP?.totalScore ?? myP?.score ?? 0) + pts;
-          const nextFound = [...currentFound, word];
-
-          const nextRoom: OnlineRoom = {
-            ...prev,
-            wordPlacements: (prev.wordPlacements || []).map(wp =>
-              (wp.word === word || normalizeArabicWord(wp.word) === normalizeArabicWord(word)) &&
-              selectedCells &&
-              selectedCells.length >= 2
-                ? { ...wp, cells: selectedCells }
-                : wp
-            ),
-            players: {
-              ...prev.players,
-              [playerId]: {
-                ...myP,
-                score: nextScore,
-                totalScore: nextTotalScore,
-                wordsFound: nextFound
-              }
+          if (!claimResult.claimed) {
+            // Opponent ALREADY claimed this word in Supabase Cloud while this player was outside Safari!
+            let syncedRoom = claimResult.room;
+            const totalW = syncedRoom.wordPlacements?.length || 7;
+            if (Object.keys(syncedRoom.claimedWords || {}).length >= totalW && syncedRoom.state !== 'FINISHED') {
+              syncedRoom = buildLocalStandingsAndFinish(syncedRoom);
             }
-          };
+            setRoom(syncedRoom);
+            sounds.playError();
+            const ownerName = claimResult.alreadyClaimedByName || opponent?.displayName || 'الخصم';
+            setKuwaitiMsg(
+              `هذه الكلمة صادها «${ownerName}» قبلك أثناء خروجك وانحسبت له! اسبق على الكلمات الباقية ⚡`
+            );
+            setCommentType('mistake');
+            setRaceFlash({
+              text: `🚨 «${displayWord}» صادها «${ownerName}» قبلك!`,
+              subtext: 'تم تحديث اللوحة بالكلمات المصطادة • اسبق على الباقي ⚡',
+              isMine: false
+            });
+            return;
+          }
 
-          const totalWordCount = prev.wordPlacements?.length || 7;
-          const oppCount = nextRoom.players[opponent?.id || '']?.wordsFound?.length || 0;
-          if (nextFound.length + oppCount >= totalWordCount) {
-            const finalized = buildLocalStandingsAndFinish(nextRoom);
-            void realtimeSync.saveCloudRoomSnapshot(finalized);
+          // Successfully claimed first!
+          sounds.playMultiplayerWordScore(1, 0);
+          if (isSpeedMode) {
+            setPlayerDeadlines(prev => ({ ...prev, [playerId]: Date.now() + 20_000 }));
+          }
+
+          let nextRoom = claimResult.room;
+          const totalWordCount = nextRoom.wordPlacements?.length || 7;
+          const totalClaimedCount = Object.keys(nextRoom.claimedWords || {}).length;
+
+          if (totalClaimedCount >= totalWordCount && nextRoom.state !== 'FINISHED') {
+            nextRoom = buildLocalStandingsAndFinish(nextRoom);
+            void realtimeSync.saveCloudRoomSnapshot(nextRoom, { skipMerge: true });
             setTimeout(() => {
               setGameFinished(true);
               setWinnerInfo({
-                id: finalized.stageWinnerId || undefined,
-                name: finalized.stageWinnerName || 'تعادل'
+                id: nextRoom.stageWinnerId || undefined,
+                name: nextRoom.stageWinnerName || 'تعادل'
               });
-              const celebWin = finalized.seriesCompleted
-                ? finalized.seriesWinnerId === playerId
-                : finalized.stageWinnerId === playerId;
+              const celebWin = nextRoom.seriesCompleted
+                ? nextRoom.seriesWinnerId === playerId
+                : nextRoom.stageWinnerId === playerId;
               if (celebWin) {
                 sounds.playVictory();
                 try {
@@ -1164,21 +1376,89 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
                 }
               }
             }, 800);
-            return finalized;
           }
 
-          void realtimeSync.saveCloudRoomSnapshot(nextRoom);
-          return nextRoom;
-        });
+          setRoom(nextRoom);
+          setKuwaitiMsg(`كفو! صدت كلمة «${displayWord}» وانحسبت لك (+${pts} نقطة)! ⚡`);
+          setCommentType('praise');
+          setRaceFlash({
+            text: `🔊 ⚡ صدت «${displayWord}» أول! انحسبت لك`,
+            subtext: `+${pts} نقطة لصالحك`,
+            isMine: true
+          });
+
+          // Broadcast word discovery + authoritative room snapshot to opponent
+          void realtimeSync.publishToRoom(
+            room.code,
+            'WORD_FOUND',
+            {
+              word: canonicalWord,
+              playerId,
+              playerName: myName,
+              playerColor: myColor,
+              displayWord,
+              wordScore: pts,
+              cells: selectedCells,
+              claimedAt: claimResult.claimedAt,
+              room: nextRoom
+            },
+            playerId
+          );
+        } finally {
+          inFlightWordsRef.current.delete(canonicalWord);
+        }
       })();
     }
   };
 
-  // Real-time listener for word discoveries by human opponent across the internet (verified by server or board placements)
+  // Real-time listener for word discoveries & state sync by human opponent across the internet
   useEffect(() => {
     void realtimeSync.subscribeToRoom(room.code, (msg) => {
       const { type, payload, senderId } = msg;
       if (String(senderId) === String(playerId) || String(payload?.playerId) === String(playerId)) {
+        return;
+      }
+
+      if (type === 'REQUEST_ROOM_SYNC') {
+        const authoritativeLocal = normalizeRoomWordOwnership(roomRef.current);
+        void realtimeSync.saveCloudRoomSnapshot(authoritativeLocal);
+        void realtimeSync.publishToRoom(
+          room.code,
+          'ROOM_STATE_SYNC',
+          { room: authoritativeLocal },
+          playerId
+        );
+        return;
+      }
+
+      if (type === 'ROOM_STATE_SYNC' && payload?.room) {
+        const merged = mergeCloudAndLocalRooms(roomRef.current, payload.room);
+        const totalW = merged.wordPlacements?.length || 7;
+        const finalMerged =
+          Object.keys(merged.claimedWords || {}).length >= totalW && merged.state !== 'FINISHED'
+            ? buildLocalStandingsAndFinish(merged)
+            : merged;
+        setRoom(finalMerged);
+        return;
+      }
+
+      if (type === 'WORD_CLAIM_REJECTED') {
+        if (payload?.room) {
+          const merged = mergeCloudAndLocalRooms(roomRef.current, payload.room);
+          setRoom(merged);
+        }
+        if (String(payload?.rejectedPlayerId) === String(playerId)) {
+          sounds.playError();
+          const ownerName = payload?.ownerName || opponent?.displayName || 'الخصم';
+          const shownW = payload?.displayWord || payload?.word || 'الكلمة';
+          setKuwaitiMsg(`هذه الكلمة «${shownW}» صادها «${ownerName}» قبلك وانحسبت له! اسبق على الباقي ⚡`);
+          setCommentType('mistake');
+          setRaceFlash({
+            text: `🚨 «${shownW}» صادها «${ownerName}» قبلك!`,
+            subtext: 'انحسبت لمن اصطادها أولاً • اسبق على الكلمات المتبقية',
+            isMine: false
+          });
+        }
         return;
       }
 
@@ -1192,11 +1472,10 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
           wordScore: payloadWordScore,
           signature: payloadSignature,
           pts: payloadRawPts,
-          cells: payloadCells
+          cells: payloadCells,
+          claimedAt: payloadClaimedAt
         } = payload || {};
 
-        // Never trust unverified MQTT WORD_FOUND or client-supplied pts when server is active:
-        // Verify with /api/rooms/verify-mqtt-message before applying any score change
         (async () => {
           let verifiedPts = Number(payloadWordScore) || 150;
           try {
@@ -1222,11 +1501,10 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
               throw new Error('Room hosted in cloud snapshot');
             }
             if (!verifyRes.ok || !verifyData?.valid) {
-              // Reject forged/unverified message!
               return;
             }
             if (verifyData.room) {
-              setRoom(verifyData.room);
+              setRoom(normalizeRoomWordOwnership(verifyData.room));
             }
           } catch {
             // Static host / Vercel fallback: validate word exists in active board and finder is a room member
@@ -1241,7 +1519,40 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
             if (!validPlacement || !validMember) return;
           }
 
-          const curPlayers = roomRef.current.players || room.players;
+          const curNorm = normalizeRoomWordOwnership(roomRef.current);
+          const canonicalWord = resolveCanonicalPlacementWord(curNorm, word);
+          const existingClaim = curNorm.claimedWords?.[canonicalWord];
+          const incomingTime = Number(payloadClaimedAt) || Date.now();
+
+          // CRITICAL: If this word was ALREADY claimed by me with an earlier or equal timestamp,
+          // REJECT the opponent's duplicate/stale claim and push our authoritative state back to them!
+          if (existingClaim && String(existingClaim.playerId) === String(playerId)) {
+            const myTime = Number(existingClaim.claimedAt) || 0;
+            if (myTime <= incomingTime) {
+              void realtimeSync.saveCloudRoomSnapshot(curNorm, { skipMerge: true });
+              void realtimeSync.publishToRoom(
+                room.code,
+                'WORD_CLAIM_REJECTED',
+                {
+                  word: canonicalWord,
+                  displayWord: dw || existingClaim.displayWord || canonicalWord,
+                  rejectedPlayerId: String(finderId || senderId),
+                  ownerId: String(playerId),
+                  ownerName: myPlayer?.displayName || 'المنافس',
+                  room: curNorm
+                },
+                playerId
+              );
+              return;
+            }
+          }
+
+          // If already claimed by the same opponent, ignore duplicate broadcast
+          if (existingClaim && String(existingClaim.playerId) !== String(playerId)) {
+            return;
+          }
+
+          const curPlayers = curNorm.players || room.players;
           const finder =
             curPlayers[finderId] ||
             Object.values(curPlayers).find(p => String(p.id) !== String(playerId));
@@ -1249,63 +1560,62 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
           const finderColor = finder?.color || payloadFinderColor || '#ec4899';
           const finderName = finder?.displayName || payloadFinderName || 'الخصم';
 
-          setFoundWords(f => (f.includes(word) ? f : [...f, word]));
-          setWordPlayerMap(m => ({ ...m, [word]: finderColor }));
-          setWordPlayerNameMap(m => ({ ...m, [word]: finderName }));
-          setWordPlayerIdMap(m => ({ ...m, [word]: resolvedFinderId }));
           if (roomRef.current.gameMode === 'SPEED_REVEAL_20S') {
             setPlayerDeadlines(prev => ({ ...prev, [resolvedFinderId]: Date.now() + 20_000 }));
           }
           sounds.playOpponentFound(1);
           setKuwaitiMsg(
-            `الخصم «${finderName}» صاد كلمة «${dw || word}» قبلك وانحسبت له (+${verifiedPts} نقطة)! اسبق على الكلمات المتبقية ⚡`
+            `الخصم «${finderName}» صاد كلمة «${dw || canonicalWord}» قبلك وانحسبت له (+${verifiedPts} نقطة)! اسبق على الكلمات المتبقية ⚡`
           );
           setCommentType('mistake');
           setRaceFlash({
-            text: `🚨 الخصم «${finderName}» صاد «${dw || word}» قبلك!`,
+            text: `🚨 الخصم «${finderName}» صاد «${dw || canonicalWord}» قبلك!`,
             subtext: `انحسبت للخصم (+${verifiedPts} نقطة) • اسبق على الكلمات المتبقية`,
             isMine: false
           });
 
           setRoom(cur => {
-            const targetKey = cur.players[resolvedFinderId]
+            const normCur = normalizeRoomWordOwnership(cur);
+            const targetKey = normCur.players[resolvedFinderId]
               ? resolvedFinderId
-              : Object.keys(cur.players).find(k => String(k) !== String(playerId)) || resolvedFinderId;
-            const finderP = cur.players[targetKey];
-            const prevWords = finderP?.wordsFound || [];
-            const alreadyHad = prevWords.includes(word);
-            const nextScore = alreadyHad ? finderP?.score || 0 : (finderP?.score || 0) + verifiedPts;
-            const nextTotalScore = alreadyHad
-              ? finderP?.totalScore ?? finderP?.score ?? 0
-              : (finderP?.totalScore ?? finderP?.score ?? 0) + verifiedPts;
-            const nextFound = alreadyHad ? prevWords : [...prevWords, word];
-            const updated: OnlineRoom = {
-              ...cur,
-              wordPlacements: (cur.wordPlacements || []).map(wp =>
-                (wp.word === word || normalizeArabicWord(wp.word) === normalizeArabicWord(word)) &&
-                Array.isArray(payloadCells) &&
-                payloadCells.length >= 2
-                  ? { ...wp, cells: payloadCells }
-                  : wp
-              ),
-              players: {
-                ...cur.players,
-                [targetKey]: {
-                  ...finderP,
-                  id: targetKey,
-                  displayName: finderP?.displayName || finderName,
-                  color: finderP?.color || finderColor,
-                  score: nextScore,
-                  totalScore: nextTotalScore,
-                  wordsFound: nextFound
-                }
+              : Object.keys(normCur.players).find(k => String(k) !== String(playerId)) || resolvedFinderId;
+
+            const nextClaimedWords = {
+              ...(normCur.claimedWords || {}),
+              [canonicalWord]: {
+                word: canonicalWord,
+                displayWord: dw || canonicalWord,
+                playerId: targetKey,
+                playerName: finderName,
+                playerColor: finderColor,
+                claimedAt: incomingTime,
+                wordScore: verifiedPts,
+                cells: Array.isArray(payloadCells) && payloadCells.length >= 2 ? payloadCells : undefined
               }
             };
 
-            const totalW = cur.wordPlacements?.length || 7;
-            const myCount = cur.players[playerId]?.wordsFound?.length || 0;
-            if (myCount + nextFound.length >= totalW && cur.state !== 'FINISHED') {
+            const updated = normalizeRoomWordOwnership({
+              ...normCur,
+              claimedWords: nextClaimedWords,
+              wordPlacements: (normCur.wordPlacements || []).map(wp =>
+                wp.word === canonicalWord
+                  ? {
+                      ...wp,
+                      foundBy: targetKey,
+                      cells:
+                        Array.isArray(payloadCells) && payloadCells.length >= 2
+                          ? payloadCells
+                          : wp.cells
+                    }
+                  : wp
+              )
+            });
+
+            const totalW = updated.wordPlacements?.length || 7;
+            const totalClaimed = Object.keys(updated.claimedWords || {}).length;
+            if (totalClaimed >= totalW && updated.state !== 'FINISHED') {
               const finalized = buildLocalStandingsAndFinish(updated);
+              void realtimeSync.saveCloudRoomSnapshot(finalized, { skipMerge: true });
               setTimeout(() => {
                 setGameFinished(true);
                 setWinnerInfo({
@@ -1326,16 +1636,22 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
               }, 800);
               return finalized;
             }
+            void realtimeSync.saveCloudRoomSnapshot(updated);
             return updated;
           });
         })();
       } else if (type === 'BATTLE_CARD_USED') {
-        const { cardId, senderName, blockedByShield, stolenAmount } = payload || {};
+        const { cardId, senderName, blockedByShield, stolenAmount, targetIds } = payload || {};
         const cardDef = BATTLE_CARD_ITEMS.find(c => c.id === cardId);
+        const cardSenderId = String(payload?.playerId || senderId || '');
 
         if (cardId === 'CARD_SHIELD') {
-          setOppShieldActive(true);
-          setKuwaitiMsg(`🛡️ الخصم «${senderName}» فعّل درع الحماية!`);
+          setOppShields(prev => ({ ...prev, [cardSenderId]: true }));
+          setKuwaitiMsg(`🛡️ اللاعب «${senderName}» فعّل درع الحماية!`);
+          return;
+        }
+
+        if (Array.isArray(targetIds) && targetIds.length > 0 && !targetIds.map(String).includes(String(playerId))) {
           return;
         }
 
@@ -1343,14 +1659,14 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
           setMyShieldActive(false);
           sounds.playVictory();
           setRaceFlash({
-            text: `🛡️ درعك صدّ كرت «${cardDef?.shortName || 'الهجوم'}» من الخصم!`,
+            text: `🛡️ درعك صدّ كرت «${cardDef?.shortName || 'الهجوم'}» من «${senderName}»!`,
             subtext: 'تم إحباط الهجوم بنجاح 🔥',
             isMine: true
           });
           realtimeSync.publishToRoom(
             room.code,
             'BATTLE_CARD_BLOCKED',
-            { cardId, blockerId: playerId, blockerName: myPlayer?.displayName || 'الخصم' },
+            { cardId, blockerId: playerId, blockerName: myPlayer?.displayName || 'المنافس' },
             playerId
           );
           return;
@@ -1366,7 +1682,9 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
             const amt = Number(stolenAmount) || 100;
             setRoom(cur => {
               const myP = cur.players[playerId];
-              const oppKey = Object.keys(cur.players).find(k => k !== playerId);
+              const oppKey = cur.players[cardSenderId]
+                ? cardSenderId
+                : Object.keys(cur.players).find(k => k !== playerId);
               const oppP = oppKey ? cur.players[oppKey] : undefined;
               const actual = Math.min(amt, myP?.score || 0);
               return {
@@ -1396,20 +1714,27 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
             });
           }
           setRaceFlash({
-            text: `${cardDef?.icon || '⚔️'} الخصم «${senderName}» أطلق عليك: ${cardDef?.name}!`,
+            text: `${cardDef?.icon || '⚔️'} «${senderName}» أطلق عليك: ${cardDef?.name}!`,
             subtext: cardDef?.durationSec ? `التأثير مستمر لمدة ${cardDef.durationSec} ثانية` : 'أسرع للتعويض!',
             isMine: false
           });
-          setKuwaitiMsg(`${cardDef?.icon || '⚔️'} الخصم استخدم عليك ${cardDef?.name}!`);
+          setKuwaitiMsg(`${cardDef?.icon || '⚔️'} «${senderName}» استخدم عليك ${cardDef?.name}!`);
           setCommentType('mistake');
         }
       } else if (type === 'BATTLE_CARD_BLOCKED') {
-        const { cardId } = payload || {};
+        const { cardId, blockerId, blockerName } = payload || {};
         const cardDef = BATTLE_CARD_ITEMS.find(c => c.id === cardId);
-        setOppShieldActive(false);
-        setOppDebuffBanner(null);
+        const bid = String(blockerId || senderId || '');
+        if (bid) {
+          setOppShields(prev => ({ ...prev, [bid]: false }));
+          setOppDebuffs(prev => {
+            const next = { ...prev };
+            delete next[bid];
+            return next;
+          });
+        }
         setRaceFlash({
-          text: `🛡️ درع الخصم صدّ كرت «${cardDef?.shortName || 'الهجوم'}»!`,
+          text: `🛡️ درع «${blockerName || 'الخصم'}» صدّ كرت «${cardDef?.shortName || 'الهجوم'}»!`,
           subtext: 'حاول مرة أخرى لكسر دفاعه',
           isMine: false
         });
@@ -1475,40 +1800,45 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
       if (unclaimed.length === 0) return;
 
       const target = unclaimed[Math.floor(Math.random() * unclaimed.length)];
-      setOpponentPath(target.cells.slice(0, 3));
+      setOpponentCursors(prev => ({
+        ...prev,
+        [rivalBot.id]: { cells: target.cells.slice(0, 3), expiresAt: Date.now() + 2500 }
+      }));
 
       setTimeout(() => {
-        setOpponentPath([]);
-        setFoundWords(f => (f.includes(target.word) ? f : [...f, target.word]));
-        setWordPlayerMap(m => ({ ...m, [target.word]: rivalBot.color || '#ec4899' }));
-        setWordPlayerNameMap(m => ({ ...m, [target.word]: rivalBot.displayName }));
-        sounds.playError();
-        setRaceFlash({
-          text: `خصمك «${rivalBot.displayName}» صاد كلمة «${target.displayWord}»!`,
-          subtext: `اسبق على الكلمات المتبقية`,
-          isMine: false
+        setOpponentCursors(prev => {
+          const copy = { ...prev };
+          delete copy[rivalBot.id];
+          return copy;
         });
-
         setRoom(cur => {
-          const rivalP = cur.players[rivalBot.id];
-          const nextScore = (rivalP?.score || 0) + 150;
-          const nextTotalScore = (rivalP?.totalScore ?? rivalP?.score ?? 0) + 150;
-          const nextFound = [...(rivalP?.wordsFound || []), target.word];
-          const updated: OnlineRoom = {
-            ...cur,
-            players: {
-              ...cur.players,
-              [rivalBot.id]: {
-                ...rivalP,
-                score: nextScore,
-                totalScore: nextTotalScore,
-                wordsFound: nextFound
-              }
+          const normCur = normalizeRoomWordOwnership(cur);
+          if (normCur.claimedWords?.[target.word]) return normCur;
+          const nextClaimed = {
+            ...(normCur.claimedWords || {}),
+            [target.word]: {
+              word: target.word,
+              displayWord: target.displayWord,
+              playerId: rivalBot.id,
+              playerName: rivalBot.displayName,
+              playerColor: rivalBot.color || ONLINE_PLAYER_COLORS[1],
+              claimedAt: Date.now(),
+              wordScore: 150,
+              cells: target.cells
             }
           };
-          const totalW = cur.wordPlacements?.length || 7;
-          const myCount = cur.players[playerId]?.wordsFound?.length || 0;
-          if (myCount + nextFound.length >= totalW) {
+          const updated = normalizeRoomWordOwnership({
+            ...normCur,
+            claimedWords: nextClaimed
+          });
+          sounds.playError();
+          setRaceFlash({
+            text: `خصمك «${rivalBot.displayName}» صاد كلمة «${target.displayWord}»!`,
+            subtext: `اسبق على الكلمات المتبقية`,
+            isMine: false
+          });
+          const totalW = updated.wordPlacements?.length || 7;
+          if (Object.keys(updated.claimedWords || {}).length >= totalW) {
             const finalized = buildLocalStandingsAndFinish(updated);
             setTimeout(() => {
               setGameFinished(true);
@@ -1536,7 +1866,7 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
     }, 11000);
 
     return () => clearInterval(timer);
-  }, [socket, playerId, gameFinished, foundWords, room.wordPlacements, room.players]);
+  }, [socket, playerId, gameFinished, foundWords, room.wordPlacements, room.players, buildLocalStandingsAndFinish]);
 
   // Fallback rematch executor via REST API (/api/rooms/rematch) or MQTT/local static host board generator
   const triggerRematchFallback = useCallback(async () => {
@@ -1674,9 +2004,11 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
       gridSize: freshBoard.gridSize,
       words: nextWords,
       wordPlacements: freshBoard.wordPlacements,
+      claimedWords: {},
       players: resetPlayers
     };
 
+    void realtimeSync.saveCloudRoomSnapshot(nextRoom, { skipMerge: true });
     realtimeSync.publishToRoom(
       activeRoom.code,
       'GAME_REMATCH_STARTED',
@@ -1750,8 +2082,8 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
     }
   };
 
-  const handleBlockOpponent = async () => {
-    if (!opponent?.username || !currentUser?.username || blockingOpponent) return;
+  const handleBlockOpponent = async (targetUsername: string, targetDisplayName: string) => {
+    if (!targetUsername || !currentUser?.username || blockingOpponent) return;
     sounds.playTap();
     setBlockingOpponent(true);
     try {
@@ -1760,7 +2092,7 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           username: currentUser.username,
-          targetUsername: opponent.username
+          targetUsername
         })
       });
       const data = await res.json().catch(() => null);
@@ -1769,7 +2101,7 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
         if (data.user && onUpdateUser) {
           onUpdateUser(data.user);
         }
-        setKuwaitiMsg(`🚫 تم حظر «${opponent.displayName}» ولن يظهر لك في الغرف أو التفاعلات لاحقاً`);
+        setKuwaitiMsg(`🚫 تم حظر «${targetDisplayName}» ولن يظهر لك في الغرف أو التفاعلات لاحقاً`);
         setCommentType('neutral');
       } else {
         sounds.playError();
@@ -1801,7 +2133,7 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
         })
       );
     } else {
-      // Static / cloud relay fallback
+      // Static / cloud relay fallback supporting 2-4 players
       if (cardId === 'CARD_SHIELD') {
         sounds.playHint();
         setMyShieldActive(true);
@@ -1810,73 +2142,125 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
         realtimeSync.publishToRoom(
           room.code,
           'BATTLE_CARD_USED',
-          { cardId, playerId, senderName: myPlayer?.displayName || 'الخصم' },
+          { cardId, playerId, senderName: myPlayer?.displayName || 'المنافس' },
           playerId
         );
         return;
       }
 
-      if (oppShieldActive) {
-        setOppShieldActive(false);
+      if (cardId === 'CARD_STEAL_POINTS') {
+        const topTarget = [...opponents].sort((a, b) => (b.score || 0) - (a.score || 0))[0];
+        if (topTarget && oppShields[topTarget.id]) {
+          setOppShields(prev => ({ ...prev, [topTarget.id]: false }));
+          sounds.playError();
+          setRaceFlash({
+            text: `🛡️ درع «${topTarget.displayName}» صدّ كرت «${cardDef.shortName}»!`,
+            subtext: 'تم كسر الدرع الآن',
+            isMine: false
+          });
+          return;
+        }
+        let stolenAmount = 0;
+        if (topTarget) {
+          stolenAmount = Math.min(100, Math.max(0, topTarget.score || 0));
+          setRoom(cur => {
+            const myP = cur.players[playerId];
+            const oppP = cur.players[topTarget.id];
+            return {
+              ...cur,
+              players: {
+                ...cur.players,
+                ...(myP
+                  ? {
+                      [playerId]: {
+                        ...myP,
+                        score: (myP.score || 0) + stolenAmount,
+                        totalScore: (myP.totalScore ?? myP.score ?? 0) + stolenAmount
+                      }
+                    }
+                  : {}),
+                ...(oppP
+                  ? {
+                      [topTarget.id]: {
+                        ...oppP,
+                        score: Math.max(0, (oppP.score || 0) - stolenAmount),
+                        totalScore: Math.max(0, (oppP.totalScore ?? oppP.score ?? 0) - stolenAmount)
+                      }
+                    }
+                  : {})
+              }
+            };
+          });
+        }
+        sounds.playVictory();
+        setRaceFlash({
+          text: `⚡ سرقت +${stolenAmount} نقطة من «${topTarget?.displayName || 'المتصدر'}»!`,
+          subtext: 'ضربة قوية 🔥',
+          isMine: true
+        });
+        setKuwaitiMsg(`${cardDef.icon} أرسلت كرت «${cardDef.name}» على «${topTarget?.displayName || 'المتصدر'}»!`);
+        setCommentType('praise');
+        realtimeSync.publishToRoom(
+          room.code,
+          'BATTLE_CARD_USED',
+          {
+            cardId,
+            playerId,
+            senderName: myPlayer?.displayName || 'المنافس',
+            targetIds: topTarget ? [topTarget.id] : [],
+            stolenAmount
+          },
+          playerId
+        );
+        return;
+      }
+
+      const shieldedOpps = opponents.filter(o => oppShields[o.id]);
+      const unshieldedOpps = opponents.filter(o => !oppShields[o.id]);
+      if (shieldedOpps.length > 0) {
+        setOppShields(prev => {
+          const next = { ...prev };
+          shieldedOpps.forEach(so => {
+            next[so.id] = false;
+          });
+          return next;
+        });
+      }
+
+      if (unshieldedOpps.length === 0) {
         sounds.playError();
         setRaceFlash({
-          text: `🛡️ درع الخصم صدّ كرت «${cardDef.shortName}»!`,
-          subtext: 'تم كسر درع الخصم الآن',
+          text: `🛡️ دروع الخصوم صدّت كرت «${cardDef.shortName}»!`,
+          subtext: 'تم كسر الدروع الآن',
           isMine: false
         });
         return;
       }
 
       sounds.playVictory();
-      let stolenAmount = 0;
-      if (cardId === 'CARD_STEAL_POINTS' && opponent) {
-        stolenAmount = Math.min(100, Math.max(0, opponent.score || 0));
-        setRoom(cur => {
-          const myP = cur.players[playerId];
-          const oppP = cur.players[opponent.id];
-          return {
-            ...cur,
-            players: {
-              ...cur.players,
-              ...(myP
-                ? {
-                    [playerId]: {
-                      ...myP,
-                      score: (myP.score || 0) + stolenAmount,
-                      totalScore: (myP.totalScore ?? myP.score ?? 0) + stolenAmount
-                    }
-                  }
-                : {}),
-              ...(oppP
-                ? {
-                    [opponent.id]: {
-                      ...oppP,
-                      score: Math.max(0, (oppP.score || 0) - stolenAmount),
-                      totalScore: Math.max(0, (oppP.totalScore ?? oppP.score ?? 0) - stolenAmount)
-                    }
-                  }
-                : {})
-            }
-          };
-        });
-      }
-
       if (cardDef.durationSec) {
-        setOppDebuffBanner({
-          label: `${cardDef.icon} الخصم متأثر بـ ${cardDef.shortName}`,
-          seconds: cardDef.durationSec
+        setOppDebuffs(prev => {
+          const next = { ...prev };
+          unshieldedOpps.forEach(uo => {
+            next[uo.id] = {
+              label: `${cardDef.icon} ${cardDef.shortName}`,
+              seconds: cardDef.durationSec!
+            };
+          });
+          return next;
         });
       }
 
+      const hitText =
+        unshieldedOpps.length > 1
+          ? `${cardDef.icon} أصبت ${unshieldedOpps.length} منافسين بـ «${cardDef.name}»!`
+          : `${cardDef.icon} أصبت «${unshieldedOpps[0].displayName}» بـ «${cardDef.name}»!`;
       setRaceFlash({
-        text:
-          cardId === 'CARD_STEAL_POINTS'
-            ? `⚡ سرقت +${stolenAmount} نقطة من الخصم!`
-            : `${cardDef.icon} أصبت الخصم بـ «${cardDef.name}»!`,
+        text: hitText,
         subtext: cardDef.durationSec ? `التأثير مستمر ${cardDef.durationSec} ثانية — اسبق الآن!` : 'ضربة قوية 🔥',
         isMine: true
       });
-      setKuwaitiMsg(`${cardDef.icon} أرسلت كرت «${cardDef.name}» على الخصم!`);
+      setKuwaitiMsg(hitText);
       setCommentType('praise');
 
       realtimeSync.publishToRoom(
@@ -1885,8 +2269,9 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
         {
           cardId,
           playerId,
-          senderName: myPlayer?.displayName || 'الخصم',
-          stolenAmount
+          senderName: myPlayer?.displayName || 'المنافس',
+          targetIds: unshieldedOpps.map(o => o.id),
+          stolenAmount: 0
         },
         playerId
       );
@@ -1894,12 +2279,10 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
   };
 
   const totalWords = room.wordPlacements?.length || 7;
-  const myWordsList = myPlayer?.wordsFound || [];
-  const oppWordsList = opponent?.wordsFound || [];
-  const myWordsCount = myWordsList.length;
-  const oppWordsCount = oppWordsList.length;
-  const myPct = Math.round((myWordsCount / Math.max(1, totalWords)) * 100);
-  const oppPct = Math.round((oppWordsCount / Math.max(1, totalWords)) * 100);
+  const orderedHudPlayers = [myPlayer, ...opponents].filter(
+    (p): p is NonNullable<typeof p> => Boolean(p)
+  );
+  const myWordsCount = (myPlayer?.wordsFound || []).length;
 
   // Helper to resolve displayWord for a normalized word
   const getDisplayWord = (raw: string) => {
@@ -1938,7 +2321,11 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
             ) : (
               <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-lime-400/15 border border-lime-400/30 text-lime-300 text-xs font-black">
                 <Zap className="w-3.5 h-3.5 fill-lime-400 text-lime-400" />
-                <span>تحدي لاعبين: اللي يصيد الكلمة أول تنحسب له • {categoryObj.name}</span>
+                <span>
+                  {playersList.length > 2
+                    ? `سباق ${playersList.length} لاعبين: اللي يصيد الكلمة أول تنحسب له • ${categoryObj.name}`
+                    : `تحدي لاعبين: اللي يصيد الكلمة أول تنحسب له • ${categoryObj.name}`}
+                </span>
               </span>
             )}
             <span className="px-3 py-1 rounded-full bg-slate-900 border border-amber-400/50 text-amber-300 text-xs font-black">
@@ -1984,228 +2371,204 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
           </div>
         </div>
 
-        {/* Both Players Battle Score Cards + Captured Words List */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-          {/* My Player */}
-          {myPlayer && (
-            <div className="p-3 rounded-2xl bg-slate-950/90 border-2 border-sky-500/50 flex flex-col gap-2 relative shadow-lg shadow-sky-950/30">
-              <div className="flex items-center gap-3">
-                <img
-                  src={myPlayer.avatar}
-                  alt={myPlayer.displayName}
-                  className="w-11 h-11 rounded-full object-cover border-2 border-sky-400 shrink-0"
-                />
-                <div className="text-right flex-1 min-w-0">
-                  <div className="flex items-center justify-between gap-1">
-                    <span className={`text-xs font-black truncate ${getNameGlowClass(currentUser?.equippedNameGlow)}`}>
-                      أنت ({myPlayer.displayName})
-                    </span>
-                    <div className="flex items-center gap-1">
-                      {isSpeedMode && !gameFinished && (
-                        <span
-                          className={`text-[10px] font-black font-mono px-2 py-0.5 rounded-full border flex items-center gap-1 ${
-                            (speedRemaining[playerId] ?? 20) <= 5
-                              ? 'bg-rose-500/25 border-rose-400 text-rose-200 animate-pulse'
-                              : (speedRemaining[playerId] ?? 20) <= 10
-                              ? 'bg-amber-500/20 border-amber-400 text-amber-200'
-                              : 'bg-cyan-500/15 border-cyan-400/50 text-cyan-200'
-                          }`}
-                          title="وقتك لصيد كلمة قبل انكشاف حرف سري عند الخصم"
-                        >
-                          <Timer className="w-3 h-3" />
-                          <span>{speedRemaining[playerId] ?? 20}ث</span>
-                        </span>
-                      )}
-                      {myShieldActive && (
-                        <span className="text-[10px] font-black px-1.5 py-0.5 rounded bg-emerald-500/20 border border-emerald-400/50 text-emerald-300">
-                          🛡️ محمي
-                        </span>
-                      )}
-                      {(myPlayer.roundWins || 0) > 0 && (
-                        <span className="text-[10px] font-black px-1.5 py-0.5 rounded bg-amber-400/20 text-amber-300">
-                          🏆 {myPlayer.roundWins}
-                        </span>
-                      )}
+        {/* All Players Battle Score Cards (Supports 2, 3, or 4 Players) */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 sm:gap-3">
+          {orderedHudPlayers.map((p, idx) => {
+            const isMe = String(p.id) === String(playerId);
+            const seatColor = getPlayerSeatColor(p.id, p.color);
+            const pWordsList = p.wordsFound || [];
+            const pWordsCount = pWordsList.length;
+            const pHasShield = isMe ? myShieldActive : Boolean(oppShields[p.id]);
+            const pDebuff = !isMe ? oppDebuffs[p.id] : null;
+            const canModerate =
+              !isMe &&
+              Boolean(currentUser?.username && p.username) &&
+              !p.id.startsWith('bot_');
+
+            return (
+              <div
+                key={p.id}
+                className="p-3 rounded-2xl bg-slate-950/90 border-2 flex flex-col gap-2 relative shadow-lg"
+                style={{
+                  borderColor: `${seatColor}88`,
+                  boxShadow: `0 6px 20px ${seatColor}1f`
+                }}
+              >
+                <div className="flex items-center gap-3">
+                  <img
+                    src={p.avatar || '/assets/images/avatar_kuwaiti_boy_1794404782928.jpg'}
+                    alt={p.displayName}
+                    className="w-11 h-11 rounded-full object-cover border-2 shrink-0"
+                    style={{ borderColor: seatColor }}
+                  />
+                  <div className="text-right flex-1 min-w-0">
+                    <div className="flex items-center justify-between gap-1">
+                      <span
+                        className={`text-xs font-black truncate ${
+                          isMe ? getNameGlowClass(currentUser?.equippedNameGlow) : ''
+                        }`}
+                        style={!isMe ? { color: seatColor } : undefined}
+                      >
+                        {isMe ? `أنت (${p.displayName})` : `${p.displayName} (لاعب ${idx + 1})`}
+                      </span>
+                      <div className="flex items-center gap-1 flex-wrap justify-end">
+                        {canModerate && (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                sounds.playTap();
+                                setReportTarget({
+                                  username: p.username,
+                                  displayName: p.displayName
+                                });
+                              }}
+                              className="p-1 rounded-lg bg-slate-900 hover:bg-rose-500/20 text-slate-400 hover:text-rose-300 border border-slate-800 cursor-pointer"
+                              title="الإبلاغ عن اللاعب"
+                            >
+                              <Flag className="w-3 h-3" />
+                            </button>
+                            <button
+                              type="button"
+                              disabled={blockingOpponent}
+                              onClick={() => handleBlockOpponent(p.username, p.displayName)}
+                              className="p-1 rounded-lg bg-slate-900 hover:bg-rose-500/20 text-slate-400 hover:text-rose-300 border border-slate-800 cursor-pointer disabled:opacity-50"
+                              title="حظر اللاعب"
+                            >
+                              <Ban className="w-3 h-3" />
+                            </button>
+                          </>
+                        )}
+                        {isSpeedMode && !gameFinished && (
+                          <span
+                            className={`text-[10px] font-black font-mono px-2 py-0.5 rounded-full border flex items-center gap-1 ${
+                              (speedRemaining[p.id] ?? 20) <= 5
+                                ? isMe
+                                  ? 'bg-rose-500/25 border-rose-400 text-rose-200 animate-pulse'
+                                  : 'bg-emerald-500/25 border-emerald-400 text-emerald-200 animate-pulse'
+                                : 'bg-slate-900 border-slate-700 text-slate-200'
+                            }`}
+                            title={
+                              isMe
+                                ? 'وقتك لصيد كلمة قبل انكشاف حرف سري عند خصومك'
+                                : 'وقت المنافس قبل أن ينكشف لك حرف سري'
+                            }
+                          >
+                            <Timer className="w-3 h-3" />
+                            <span>{speedRemaining[p.id] ?? 20}ث</span>
+                          </span>
+                        )}
+                        {pHasShield && (
+                          <span className="text-[10px] font-black px-1.5 py-0.5 rounded bg-emerald-500/20 border border-emerald-400/50 text-emerald-300">
+                            🛡️ محمي
+                          </span>
+                        )}
+                        {pDebuff && (
+                          <span className="text-[10px] font-black px-1.5 py-0.5 rounded bg-amber-500/25 border border-amber-400/60 text-amber-200 animate-pulse">
+                            {pDebuff.label} ({pDebuff.seconds}ث)
+                          </span>
+                        )}
+                        {(p.roundWins || 0) > 0 && (
+                          <span className="text-[10px] font-black px-1.5 py-0.5 rounded bg-amber-400/20 text-amber-300">
+                            🏆 {p.roundWins}
+                          </span>
+                        )}
+                      </div>
                     </div>
+                    <div className="flex items-center justify-between mt-1 gap-1.5 flex-wrap">
+                      <div
+                        className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-lg border text-xs font-black"
+                        style={{
+                          backgroundColor: `${seatColor}26`,
+                          borderColor: `${seatColor}66`,
+                          color: '#f8fafc'
+                        }}
+                      >
+                        <span>{isMe ? `صدت: ${pWordsCount}` : `صاد: ${pWordsCount}`} كلمات</span>
+                      </div>
+                      <div className="text-left">
+                        <span className="text-sm font-black text-white">{p.score} نقطة</span>
+                        {(room.roundNumber || 1) > 1 && (
+                          <span className="block text-[10px] font-bold" style={{ color: seatColor }}>
+                            إجمالي: {p.totalScore ?? p.score}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                    {(p.streak || 0) >= 2 && (
+                      <span
+                        className="inline-flex items-center gap-0.5 text-[10px] font-black animate-bounce mt-0.5"
+                        style={{ color: seatColor }}
+                      >
+                        <Flame className="w-3 h-3 fill-current" />
+                        <span>كومبو x{p.streak}</span>
+                      </span>
+                    )}
                   </div>
-                  <div className="flex items-center justify-between mt-1 gap-1.5 flex-wrap">
-                    <div className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-lg bg-sky-500/20 border border-sky-400/40 text-sky-200 text-xs font-black">
-                      <span>صدت: {myWordsCount} كلمات</span>
-                    </div>
-                    <div className="text-left">
-                      <span className="text-sm font-black text-white">{myPlayer.score} نقطة</span>
-                      {(room.roundNumber || 1) > 1 && (
-                        <span className="block text-[10px] font-bold text-cyan-300">
-                          إجمالي: {myPlayer.totalScore ?? myPlayer.score}
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                  {(myPlayer.streak || 0) >= 2 && (
-                    <span className="inline-flex items-center gap-0.5 text-[10px] font-black text-amber-400 animate-bounce mt-0.5">
-                      <Flame className="w-3 h-3 fill-amber-400" />
-                      <span>كومبو x{myPlayer.streak}</span>
+                </div>
+
+                {/* Captured Words Chips */}
+                <div className="pt-1.5 border-t border-slate-800/80 flex items-center gap-1.5 flex-wrap min-h-[26px]">
+                  <span className="text-[10px] font-bold text-slate-400">
+                    {isMe ? 'كلماتك:' : `كلمات ${p.displayName}:`}
+                  </span>
+                  {pWordsList.length === 0 ? (
+                    <span className="text-[10px] text-slate-500">
+                      {isMe ? 'لم تصد أي كلمة بعد...' : 'لم يصد أي كلمة بعد...'}
                     </span>
+                  ) : (
+                    pWordsList.map(w => (
+                      <span
+                        key={w}
+                        className="px-2 py-0.5 rounded-full border text-[10px] font-black"
+                        style={{
+                          backgroundColor: `${seatColor}30`,
+                          borderColor: seatColor,
+                          color: '#f8fafc'
+                        }}
+                      >
+                        {isMe ? '✓' : '★'} {getDisplayWord(w)}
+                      </span>
+                    ))
                   )}
                 </div>
               </div>
-
-              {/* Captured Words Chips for Player 1 */}
-              <div className="pt-1.5 border-t border-slate-800/80 flex items-center gap-1.5 flex-wrap min-h-[26px]">
-                <span className="text-[10px] font-bold text-slate-400">كلماتك المصيدة:</span>
-                {myWordsList.length === 0 ? (
-                  <span className="text-[10px] text-slate-500">لم تصد أي كلمة بعد...</span>
-                ) : (
-                  myWordsList.map(w => (
-                    <span
-                      key={w}
-                      className="px-2 py-0.5 rounded-full bg-sky-500/25 border border-sky-400 text-sky-200 text-[10px] font-black"
-                    >
-                      ✓ {getDisplayWord(w)}
-                    </span>
-                  ))
-                )}
-              </div>
-            </div>
-          )}
-
-          {/* Opponent Player */}
-          {opponent ? (
-            <div className="p-3 rounded-2xl bg-slate-950/90 border-2 border-pink-500/50 flex flex-col gap-2 relative shadow-lg shadow-pink-950/30">
-              <div className="flex items-center gap-3">
-                <img
-                  src={opponent.avatar}
-                  alt={opponent.displayName}
-                  className="w-11 h-11 rounded-full object-cover border-2 border-pink-400 shrink-0"
-                />
-                <div className="text-right flex-1 min-w-0">
-                  <div className="flex items-center justify-between gap-1">
-                    <span className="text-xs font-black text-pink-400 truncate">
-                      الخصم ({opponent.displayName})
-                    </span>
-                    <div className="flex items-center gap-1">
-                      {currentUser?.username && opponent.username && !opponent.id.startsWith('bot_') && (
-                        <>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              sounds.playTap();
-                              setReportTarget({
-                                username: opponent.username,
-                                displayName: opponent.displayName
-                              });
-                            }}
-                            className="p-1 rounded-lg bg-slate-900 hover:bg-rose-500/20 text-slate-400 hover:text-rose-300 border border-slate-800 cursor-pointer"
-                            title="الإبلاغ عن اللاعب"
-                          >
-                            <Flag className="w-3 h-3" />
-                          </button>
-                          <button
-                            type="button"
-                            disabled={blockingOpponent}
-                            onClick={handleBlockOpponent}
-                            className="p-1 rounded-lg bg-slate-900 hover:bg-rose-500/20 text-slate-400 hover:text-rose-300 border border-slate-800 cursor-pointer disabled:opacity-50"
-                            title="حظر اللاعب"
-                          >
-                            <Ban className="w-3 h-3" />
-                          </button>
-                        </>
-                      )}
-                      {isSpeedMode && !gameFinished && (
-                        <span
-                          className={`text-[10px] font-black font-mono px-2 py-0.5 rounded-full border flex items-center gap-1 ${
-                            (speedRemaining[opponent.id] ?? 20) <= 5
-                              ? 'bg-emerald-500/25 border-emerald-400 text-emerald-200 animate-pulse'
-                              : 'bg-pink-500/15 border-pink-400/50 text-pink-200'
-                          }`}
-                          title="وقت الخصم قبل أن ينكشف لك حرف سري"
-                        >
-                          <Timer className="w-3 h-3" />
-                          <span>{speedRemaining[opponent.id] ?? 20}ث</span>
-                        </span>
-                      )}
-                      {oppShieldActive && (
-                        <span className="text-[10px] font-black px-1.5 py-0.5 rounded bg-emerald-500/20 border border-emerald-400/50 text-emerald-300">
-                          🛡️ محمي
-                        </span>
-                      )}
-                      {oppDebuffBanner && (
-                        <span className="text-[10px] font-black px-1.5 py-0.5 rounded bg-amber-500/25 border border-amber-400/60 text-amber-200 animate-pulse">
-                          {oppDebuffBanner.label} ({oppDebuffBanner.seconds}ث)
-                        </span>
-                      )}
-                      {(opponent.roundWins || 0) > 0 && (
-                        <span className="text-[10px] font-black px-1.5 py-0.5 rounded bg-amber-400/20 text-amber-300">
-                          🏆 {opponent.roundWins}
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                  <div className="flex items-center justify-between mt-1 gap-1.5 flex-wrap">
-                    <div className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-lg bg-pink-500/20 border border-pink-400/40 text-pink-200 text-xs font-black">
-                      <span>صاد: {oppWordsCount} كلمات</span>
-                    </div>
-                    <div className="text-left">
-                      <span className="text-sm font-black text-white">{opponent.score} نقطة</span>
-                      {(room.roundNumber || 1) > 1 && (
-                        <span className="block text-[10px] font-bold text-pink-300">
-                          إجمالي: {opponent.totalScore ?? opponent.score}
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                  {(opponent.streak || 0) >= 2 && (
-                    <span className="inline-flex items-center gap-0.5 text-[10px] font-black text-pink-400 animate-bounce mt-0.5">
-                      <Flame className="w-3 h-3 fill-pink-400" />
-                      <span>كومبو x{opponent.streak}</span>
-                    </span>
-                  )}
-                </div>
-              </div>
-
-              {/* Captured Words Chips for Player 2 */}
-              <div className="pt-1.5 border-t border-slate-800/80 flex items-center gap-1.5 flex-wrap min-h-[26px]">
-                <span className="text-[10px] font-bold text-slate-400">كلمات الخصم:</span>
-                {oppWordsList.length === 0 ? (
-                  <span className="text-[10px] text-slate-500">لم يصد أي كلمة بعد...</span>
-                ) : (
-                  oppWordsList.map(w => (
-                    <span
-                      key={w}
-                      className="px-2 py-0.5 rounded-full bg-pink-500/25 border border-pink-400 text-pink-200 text-[10px] font-black"
-                    >
-                      ✗ {getDisplayWord(w)}
-                    </span>
-                  ))
-                )}
-              </div>
-            </div>
-          ) : (
-            <div className="p-3 rounded-2xl bg-slate-950/60 border border-dashed border-slate-800 text-xs text-slate-500 flex items-center justify-center">
-              بانتظار الخصم...
-            </div>
-          )}
+            );
+          })}
         </div>
 
-        {/* Live Tug-of-War Word Race Progress Bar */}
+        {/* Multi-Player Live Word Race Progress Bar */}
         <div className="mt-3">
-          <div className="flex items-center justify-between text-[11px] font-black mb-1 px-1">
-            <span className="text-sky-400">رصيدك: {myWordsCount} كلمات</span>
+          <div className="flex items-center justify-between text-[11px] font-black mb-1 px-1 flex-wrap gap-1.5">
+            <div className="flex items-center gap-2.5 flex-wrap">
+              {orderedHudPlayers.map(p => {
+                const isMe = String(p.id) === String(playerId);
+                const seatColor = getPlayerSeatColor(p.id, p.color);
+                return (
+                  <span key={p.id} style={{ color: seatColor }}>
+                    {isMe ? 'أنت' : p.displayName}: {(p.wordsFound || []).length}
+                  </span>
+                );
+              })}
+            </div>
             <span className="text-slate-300">
               متبقي في الطاولة: {Math.max(0, totalWords - foundWords.length)} من {totalWords}
             </span>
-            <span className="text-pink-400">رصيد الخصم: {oppWordsCount} كلمات</span>
           </div>
           <div className="w-full h-3 rounded-full bg-slate-950 border border-slate-800 overflow-hidden flex">
-            <div
-              className="h-full bg-gradient-to-l from-sky-400 to-cyan-500 transition-all duration-300"
-              style={{ width: `${myPct}%` }}
-            />
+            {orderedHudPlayers.map(p => {
+              const seatColor = getPlayerSeatColor(p.id, p.color);
+              const pct = ((p.wordsFound || []).length / Math.max(1, totalWords)) * 100;
+              if (pct <= 0) return null;
+              return (
+                <div
+                  key={p.id}
+                  className="h-full transition-all duration-300"
+                  style={{ width: `${pct}%`, backgroundColor: seatColor }}
+                />
+              );
+            })}
             <div className="flex-1 bg-slate-900" />
-            <div
-              className="h-full bg-gradient-to-r from-pink-500 to-rose-400 transition-all duration-300"
-              style={{ width: `${oppPct}%` }}
-            />
           </div>
         </div>
       </div>
@@ -2311,7 +2674,7 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
           </div>
         )}
 
-      {/* Game Board with Live Opponent Selection Cursor & Active Battle Card Effects */}
+      {/* Game Board with Live Multi-Opponent Selection Cursors & Active Battle Card Effects */}
       <div className="flex justify-center py-1">
         <GameBoard
           grid={room.grid}
@@ -2319,9 +2682,18 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
           wordPlacements={room.wordPlacements}
           foundWords={foundWords}
           playerColorMap={wordPlayerMap}
-          opponentPath={opponentPath}
-          opponentColor={opponent?.color || '#ec4899'}
-          opponentName={opponent?.displayName}
+          opponentPaths={opponents
+            .map(opp => {
+              const cur = opponentCursors[opp.id];
+              if (!cur || cur.cells.length === 0 || cur.expiresAt < Date.now()) return null;
+              return {
+                playerId: opp.id,
+                cells: cur.cells,
+                color: getPlayerSeatColor(opp.id, opp.color),
+                name: opp.displayName
+              };
+            })
+            .filter((x): x is NonNullable<typeof x> => Boolean(x))}
           onSelectionDrag={handleSelectionDrag}
           onWordSelected={handleWordSelected}
           revealedCells={
@@ -2376,18 +2748,45 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
         />
       )}
 
-      {/* Game Finished Winner Modal: Stage Result + Cumulative Standings + Final Champion */}
+      {/* Game Finished Winner Modal: Stage Result + Cumulative Standings + Final Champion (2-4 Players) */}
       {gameFinished && winnerInfo && (() => {
         const currentRound = room.roundNumber || 1;
         const totalStages = room.stagesCount || 50;
         const isSeriesCompleted = Boolean(room.seriesCompleted || currentRound >= totalStages);
 
-        const myStageScore = myPlayer?.score || 0;
-        const oppStageScore = opponent?.score || 0;
-        const myTotalScore = myPlayer?.totalScore ?? myStageScore;
-        const oppTotalScore = opponent?.totalScore ?? oppStageScore;
-        const myWins = myPlayer?.roundWins || 0;
-        const oppWins = opponent?.roundWins || 0;
+        const allRankedPlayers = [...playersList].sort((a, b) => {
+          const rwDiff = (b.roundWins || 0) - (a.roundWins || 0);
+          if (rwDiff !== 0) return rwDiff;
+          const totalDiff = (b.totalScore ?? b.score ?? 0) - (a.totalScore ?? a.score ?? 0);
+          if (totalDiff !== 0) return totalDiff;
+          return (b.score || 0) - (a.score || 0);
+        });
+
+        const topByWins = [...playersList].sort((a, b) => (b.roundWins || 0) - (a.roundWins || 0));
+        const topByPoints = [...playersList].sort(
+          (a, b) => (b.totalScore ?? b.score ?? 0) - (a.totalScore ?? a.score ?? 0)
+        );
+
+        const winsTie =
+          topByWins.length > 1 && (topByWins[0]?.roundWins || 0) === (topByWins[1]?.roundWins || 0);
+        const ptsTie =
+          topByPoints.length > 1 &&
+          (topByPoints[0]?.totalScore ?? topByPoints[0]?.score ?? 0) ===
+            (topByPoints[1]?.totalScore ?? topByPoints[1]?.score ?? 0);
+
+        const winsLeaderText =
+          playersList.length <= 1
+            ? `🏆 الفوز: ${myPlayer?.displayName || 'أنت'} (${myPlayer?.roundWins || 0})`
+            : winsTie
+            ? `🤝 تعادل في عدد الفوز (${topByWins[0]?.roundWins || 0})`
+            : `🏆 المتقدم بالفوز: ${String(topByWins[0]?.id) === String(playerId) ? 'أنت' : topByWins[0]?.displayName} (${topByWins[0]?.roundWins || 0})`;
+
+        const pointsLeaderText =
+          playersList.length <= 1
+            ? `⚡ النقاط: ${myPlayer?.totalScore ?? myPlayer?.score ?? 0}`
+            : ptsTie
+            ? `🤝 تعادل في مجموع النقاط (${topByPoints[0]?.totalScore ?? topByPoints[0]?.score ?? 0})`
+            : `⚡ المتقدم بالنقاط: ${String(topByPoints[0]?.id) === String(playerId) ? 'أنت' : topByPoints[0]?.displayName} (${topByPoints[0]?.totalScore ?? topByPoints[0]?.score ?? 0})`;
 
         const stageWinnerIdResolved =
           room.stageWinnerId !== undefined ? room.stageWinnerId : winnerInfo.id || null;
@@ -2395,59 +2794,36 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
           room.stageWinnerName || winnerInfo.name || 'تعادل';
         const isStageTie = !stageWinnerIdResolved || stageWinnerNameResolved === 'تعادل';
 
-        const winsLeaderText = !opponent
-          ? `🏆 الفوز: ${myPlayer?.displayName || 'أنت'} (${myWins})`
-          : myWins > oppWins
-          ? `🏆 المتقدم بالفوز: أنت (${myWins} مقابل ${oppWins})`
-          : oppWins > myWins
-          ? `🏆 المتقدم بالفوز: ${opponent.displayName} (${oppWins} مقابل ${myWins})`
-          : `🤝 تعادل في عدد الفوز (${myWins} - ${oppWins})`;
-
-        const pointsLeaderText = !opponent
-          ? `⚡ النقاط: ${myTotalScore}`
-          : myTotalScore > oppTotalScore
-          ? `⚡ المتقدم بالنقاط: أنت (${myTotalScore} مقابل ${oppTotalScore})`
-          : oppTotalScore > myTotalScore
-          ? `⚡ المتقدم بالنقاط: ${opponent.displayName} (${oppTotalScore} مقابل ${myTotalScore})`
-          : `🤝 تعادل في مجموع النقاط (${myTotalScore} - ${oppTotalScore})`;
-
         let resolvedSeriesWinnerId = room.seriesWinnerId ?? null;
         let resolvedSeriesWinnerName = room.seriesWinnerName || '';
         if (isSeriesCompleted && !resolvedSeriesWinnerId) {
-          if (!opponent) {
-            resolvedSeriesWinnerId = playerId;
-            resolvedSeriesWinnerName = myPlayer?.displayName || 'أنت';
-          } else if (myWins !== oppWins) {
-            resolvedSeriesWinnerId = myWins > oppWins ? playerId : opponent.id;
-            resolvedSeriesWinnerName = myWins > oppWins ? myPlayer?.displayName || 'أنت' : opponent.displayName;
-          } else if (myTotalScore !== oppTotalScore) {
-            resolvedSeriesWinnerId = myTotalScore > oppTotalScore ? playerId : opponent.id;
-            resolvedSeriesWinnerName = myTotalScore > oppTotalScore ? myPlayer?.displayName || 'أنت' : opponent.displayName;
-          } else {
+          const first = allRankedPlayers[0];
+          const second = allRankedPlayers[1];
+          const overallTie =
+            first &&
+            second &&
+            (first.roundWins || 0) === (second.roundWins || 0) &&
+            (first.totalScore ?? first.score ?? 0) === (second.totalScore ?? second.score ?? 0);
+          if (overallTie) {
             resolvedSeriesWinnerId = 'DRAW';
             resolvedSeriesWinnerName = 'تعادل بطولي';
+          } else if (first) {
+            resolvedSeriesWinnerId = first.id;
+            resolvedSeriesWinnerName = first.displayName;
           }
         }
 
         const isMeSeriesWinner = isSeriesCompleted && resolvedSeriesWinnerId === playerId;
         const isMeStageWinner = stageWinnerIdResolved === playerId;
 
-        const playerWinsSummary = [
-          {
-            name: `أنت (${myPlayer?.displayName || 'لاعب 1'})`,
-            wins: myWins,
-            color: '#38bdf8'
-          },
-          ...(opponent
-            ? [
-                {
-                  name: `الخصم (${opponent.displayName})`,
-                  wins: oppWins,
-                  color: '#ec4899'
-                }
-              ]
-            : [])
-        ];
+        const playerWinsSummary = allRankedPlayers.map(p => ({
+          name: String(p.id) === String(playerId) ? `أنت (${p.displayName})` : p.displayName,
+          wins: p.roundWins || 0,
+          color: getPlayerSeatColor(p.id, p.color)
+        }));
+
+        const myStageScore = myPlayer?.score || 0;
+        const myTotalScore = myPlayer?.totalScore ?? myStageScore;
 
         return (
           <ResultsModal
@@ -2457,18 +2833,12 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
                 ? Math.max(12, Math.round((Date.now() - room.startedAt) / 1000))
                 : 45
             }
-            score={
-              isSeriesCompleted
-                ? Math.max(myTotalScore, oppTotalScore)
-                : isMeStageWinner
-                ? myStageScore
-                : oppStageScore || myStageScore
-            }
+            score={isSeriesCompleted ? myTotalScore : myStageScore}
             earnedXP={isSeriesCompleted ? (isMeSeriesWinner ? 600 : 250) : isMeStageWinner ? 300 : 120}
             earnedCoins={isSeriesCompleted ? (isMeSeriesWinner ? 350 : 150) : isMeStageWinner ? 175 : 75}
             levelNumber={currentRound}
             totalLevels={totalStages}
-            wordsFoundCount={isMeStageWinner ? myWordsCount : oppWordsCount}
+            wordsFoundCount={myWordsCount}
             totalWordsCount={totalWords}
             playerName={myPlayer?.displayName}
             winnerName={stageWinnerNameResolved}
@@ -2486,32 +2856,19 @@ export const OnlineGameScreen: React.FC<OnlineGameScreenProps> = ({
               playerWinsSummary
             }}
             categoryName={categoryObj.name}
-            matchPlayers={[
-              {
-                name: `أنت (${myPlayer?.displayName || 'لاعب 1'})`,
-                score: myStageScore,
-                totalScore: myTotalScore,
-                wordsCount: myWordsCount,
-                color: '#38bdf8',
-                roundWins: myWins,
-                isStageWinner: isMeStageWinner,
-                isSeriesWinner: isMeSeriesWinner
-              },
-              ...(opponent
-                ? [
-                    {
-                      name: `الخصم (${opponent.displayName})`,
-                      score: oppStageScore,
-                      totalScore: oppTotalScore,
-                      wordsCount: oppWordsCount,
-                      color: '#ec4899',
-                      roundWins: oppWins,
-                      isStageWinner: stageWinnerIdResolved === opponent.id,
-                      isSeriesWinner: isSeriesCompleted && resolvedSeriesWinnerId === opponent.id
-                    }
-                  ]
-                : [])
-            ]}
+            matchPlayers={allRankedPlayers.map(p => {
+              const isMe = String(p.id) === String(playerId);
+              return {
+                name: isMe ? `أنت (${p.displayName})` : p.displayName,
+                score: p.score || 0,
+                totalScore: p.totalScore ?? p.score ?? 0,
+                wordsCount: (p.wordsFound || []).length,
+                color: getPlayerSeatColor(p.id, p.color),
+                roundWins: p.roundWins || 0,
+                isStageWinner: stageWinnerIdResolved === p.id,
+                isSeriesWinner: isSeriesCompleted && resolvedSeriesWinnerId === p.id
+              };
+            })}
             primaryButtonLabel={
               isSeriesCompleted
                 ? 'العودة لصالة الأونلاين'

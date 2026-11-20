@@ -757,19 +757,62 @@ async function syncProductionUserToSupabase(user: UserRecord): Promise<void> {
   if (!isRealCloudSyncUser(user.username)) return;
 
   try {
+    let mergedCompletedLevels = mergeCompletedLevelsRecord(user.completedLevels, null);
+    let mergedXp = user.xp || 0;
+    let mergedLevel = Math.max(user.level || 1, Math.floor(mergedXp / 300) + 1);
+    let mergedWins = user.multiplayerWins || 0;
+    let mergedLosses = user.multiplayerLosses || 0;
+    let mergedAchievements = Array.isArray(user.achievements) ? [...user.achievements] : [];
+
+    // Guard against overwriting higher cloud progress if this instance didn't have it yet
+    try {
+      const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      const timer = controller ? setTimeout(() => controller.abort(), 1800) : null;
+      try {
+        const existingRes = await fetch(
+          `${SERVER_SUPABASE_URL}/rest/v1/profiles?username=eq.${encodeURIComponent(user.username)}&select=level,xp,completed_levels,multiplayer_wins,multiplayer_losses,achievements&limit=1`,
+          {
+            headers: {
+              apikey: SERVER_SUPABASE_KEY,
+              Authorization: `Bearer ${SERVER_SUPABASE_KEY}`
+            },
+            ...(controller ? { signal: controller.signal } : {})
+          }
+        );
+        if (existingRes.ok) {
+          const rows = (await existingRes.json()) as any[];
+          const cloudRow = Array.isArray(rows) ? rows[0] : null;
+          if (cloudRow) {
+            mergedCompletedLevels = mergeCompletedLevelsRecord(mergedCompletedLevels, cloudRow.completed_levels);
+            mergedXp = Math.max(mergedXp, Number(cloudRow.xp) || 0);
+            mergedLevel = Math.max(mergedLevel, Number(cloudRow.level) || 1, Math.floor(mergedXp / 300) + 1);
+            mergedWins = Math.max(mergedWins, Number(cloudRow.multiplayer_wins) || 0);
+            mergedLosses = Math.max(mergedLosses, Number(cloudRow.multiplayer_losses) || 0);
+            if (Array.isArray(cloudRow.achievements)) {
+              mergedAchievements = Array.from(new Set([...mergedAchievements, ...cloudRow.achievements]));
+            }
+          }
+        }
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    } catch {
+      // Proceed with local record if pre-fetch fails
+    }
+
     const payload: Record<string, unknown> = {
       id: user.id,
       username: user.username,
       display_name: user.displayName,
       avatar: user.avatar,
-      level: user.level || 1,
-      xp: user.xp || 0,
+      level: mergedLevel,
+      xp: mergedXp,
       coins: user.coins ?? 150,
       hints_remaining: user.hintsRemaining ?? 5,
-      completed_levels: user.completedLevels || {},
-      multiplayer_wins: user.multiplayerWins || 0,
-      multiplayer_losses: user.multiplayerLosses || 0,
-      achievements: user.achievements || [],
+      completed_levels: mergedCompletedLevels,
+      multiplayer_wins: mergedWins,
+      multiplayer_losses: mergedLosses,
+      achievements: mergedAchievements,
       updated_at: new Date().toISOString()
     };
     if (user.email) {
@@ -821,6 +864,45 @@ async function deleteProductionUserFromSupabase(username: string): Promise<{ att
   }
 }
 
+function mergeCompletedLevelsRecord(
+  a?: Record<string, { stars: number; bestTime: number; score: number; accuracy?: number; completedAt?: string }> | null,
+  b?: Record<string, { stars: number; bestTime: number; score: number; accuracy?: number; completedAt?: string }> | null
+): Record<string, { stars: number; bestTime: number; score: number; accuracy?: number; completedAt?: string }> {
+  const merged: Record<string, { stars: number; bestTime: number; score: number; accuracy?: number; completedAt?: string }> = {};
+  const addSrc = (src: any) => {
+    if (!src || typeof src !== 'object') return;
+    for (const [k, rec] of Object.entries<any>(src)) {
+      if (!rec || typeof rec !== 'object') continue;
+      const existing = merged[k];
+      const nextStars = Math.max(0, Number(rec.stars) || 0);
+      const nextTime = Number(rec.bestTime) > 0 ? Number(rec.bestTime) : 9999;
+      const nextScore = Math.max(0, Number(rec.score) || 0);
+      const nextAcc = Math.max(0, Number(rec.accuracy) || 0);
+      if (!existing) {
+        merged[k] = {
+          stars: nextStars,
+          bestTime: nextTime,
+          score: nextScore,
+          ...(nextAcc > 0 ? { accuracy: nextAcc } : {}),
+          ...(rec.completedAt ? { completedAt: rec.completedAt } : {})
+        };
+      } else {
+        const bestAcc = Math.max(Number(existing.accuracy) || 0, nextAcc);
+        merged[k] = {
+          stars: Math.max(existing.stars, nextStars),
+          bestTime: Math.min(existing.bestTime > 0 ? existing.bestTime : 9999, nextTime),
+          score: Math.max(existing.score, nextScore),
+          ...(bestAcc > 0 ? { accuracy: bestAcc } : {}),
+          completedAt: existing.completedAt || rec.completedAt
+        };
+      }
+    }
+  };
+  addSrc(a);
+  addSrc(b);
+  return merged;
+}
+
 function hydrateStateWithSupabaseRows(targetState: DatabaseState, rows: any[]): boolean {
   if (!Array.isArray(rows) || rows.length === 0) return false;
   const deletedSet = new Set((targetState.deletedUsernames || []).map(u => normalizeUsername(u)));
@@ -842,7 +924,7 @@ function hydrateStateWithSupabaseRows(targetState: DatabaseState, rows: any[]): 
         xp: Number(row.xp) || 0,
         coins: typeof row.coins === 'number' ? row.coins : 150,
         hintsRemaining: typeof row.hints_remaining === 'number' ? row.hints_remaining : 5,
-        completedLevels: row.completed_levels || {},
+        completedLevels: mergeCompletedLevelsRecord(row.completed_levels, null),
         multiplayerWins: Number(row.multiplayer_wins) || 0,
         multiplayerLosses: Number(row.multiplayer_losses) || 0,
         achievements: Array.isArray(row.achievements) ? row.achievements : [],
@@ -858,16 +940,72 @@ function hydrateStateWithSupabaseRows(targetState: DatabaseState, rows: any[]): 
         existing.email = String(row.email).toLowerCase();
         changed = true;
       }
-      if ((Number(row.xp) || 0) > (existing.xp || 0)) {
-        existing.xp = Number(row.xp) || existing.xp;
-        existing.level = Math.max(Number(row.level) || 1, existing.level || 1);
-        existing.completedLevels = { ...(row.completed_levels || {}), ...(existing.completedLevels || {}) };
+      const prevCount = Object.keys(existing.completedLevels || {}).length;
+      const mergedLevels = mergeCompletedLevelsRecord(existing.completedLevels, row.completed_levels);
+      const nextCount = Object.keys(mergedLevels).length;
+      const cloudXp = Number(row.xp) || 0;
+      const cloudLevel = Number(row.level) || 1;
+      const cloudWins = Number(row.multiplayer_wins) || 0;
+      const cloudLosses = Number(row.multiplayer_losses) || 0;
+      const cloudAchievements = Array.isArray(row.achievements) ? row.achievements : [];
+
+      if (
+        nextCount > prevCount ||
+        cloudXp > (existing.xp || 0) ||
+        cloudLevel > (existing.level || 1) ||
+        cloudWins > (existing.multiplayerWins || 0) ||
+        cloudLosses > (existing.multiplayerLosses || 0) ||
+        cloudAchievements.some((a: string) => !(existing.achievements || []).includes(a))
+      ) {
+        existing.completedLevels = mergedLevels;
+        existing.xp = Math.max(existing.xp || 0, cloudXp);
+        existing.level = Math.max(existing.level || 1, cloudLevel, Math.floor(existing.xp / 300) + 1);
+        existing.multiplayerWins = Math.max(existing.multiplayerWins || 0, cloudWins);
+        existing.multiplayerLosses = Math.max(existing.multiplayerLosses || 0, cloudLosses);
+        existing.achievements = Array.from(new Set([...(existing.achievements || []), ...cloudAchievements]));
+        existing.completedLevelsCount = Object.keys(mergedLevels).length;
+        existing.totalScore = Object.values(mergedLevels).reduce((acc, l) => acc + (l.score || 0), 0);
         ensureUserFields(existing);
         changed = true;
       }
     }
   }
   return changed;
+}
+
+async function hydrateSingleProductionUserFromSupabase(usernameOrEmail: string): Promise<UserRecord | null> {
+  if (!SERVER_SUPABASE_URL || !SERVER_SUPABASE_KEY) return null;
+  const raw = String(usernameOrEmail || '').trim().toLowerCase();
+  if (!raw) return null;
+  const clean = normalizeUsername(raw);
+  if (!isRealCloudSyncUser(clean)) return null;
+
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timer = controller ? setTimeout(() => controller.abort(), 2200) : null;
+  try {
+    const filterQuery = raw.includes('@')
+      ? `email=eq.${encodeURIComponent(raw)}`
+      : `username=eq.${encodeURIComponent(clean)}`;
+    const sbRes = await fetch(`${SERVER_SUPABASE_URL}/rest/v1/profiles?${filterQuery}&select=*&limit=1`, {
+      headers: {
+        apikey: SERVER_SUPABASE_KEY,
+        Authorization: `Bearer ${SERVER_SUPABASE_KEY}`
+      },
+      ...(controller ? { signal: controller.signal } : {})
+    });
+    if (!sbRes.ok) return null;
+    const rows = (await sbRes.json()) as any[];
+    if (Array.isArray(rows) && rows.length > 0) {
+      hydrateStateWithSupabaseRows(prodDb, rows);
+      const resolvedKey = normalizeUsername(rows[0].username || clean);
+      return prodDb.users[resolvedKey] || null;
+    }
+  } catch {
+    // Non-blocking cloud lookup
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  return null;
 }
 
 async function hydrateProductionUsersFromSupabase(): Promise<void> {
@@ -900,11 +1038,14 @@ function saveDatabase(state: DatabaseState): boolean {
 }
 
 // In-memory active Online Multiplayer Rooms
+const ONLINE_PLAYER_COLORS = ['#0ea5e9', '#ec4899', '#10b981', '#f59e0b'] as const;
+
 interface ActiveRoom {
   code: string;
   roomName: string;
   hostId: string;
   isPublic: boolean;
+  maxPlayers?: number;
   gameMode: 'WORD_RACE' | 'SPEED_REVEAL_20S';
   difficulty?: OnlineDifficulty;
   usedWords?: string[];
@@ -965,6 +1106,26 @@ interface ActiveRoom {
   startedAt?: number;
   winnerId?: string;
   chatMessages: { sender: string; text: string; time: number }[];
+}
+
+function normalizeMaxPlayers(raw: unknown): number {
+  const n = Math.floor(Number(raw));
+  if (!Number.isFinite(n) || n < 2) return 2;
+  return Math.min(4, n);
+}
+
+function assignRoomPlayerColor(room: ActiveRoom, playerId: string): string {
+  const existing = room.players?.[playerId]?.color;
+  if (existing) return existing;
+  if (playerId === room.hostId) return ONLINE_PLAYER_COLORS[0];
+  const used = new Set(
+    Object.values(room.players || {})
+      .map(p => (p.color || '').toLowerCase())
+      .filter(Boolean)
+  );
+  const free = ONLINE_PLAYER_COLORS.find(c => !used.has(c.toLowerCase()));
+  if (free) return free;
+  return ONLINE_PLAYER_COLORS[Object.keys(room.players || {}).length % ONLINE_PLAYER_COLORS.length];
 }
 
 function normalizeStagesCount(raw: unknown): number {
@@ -1330,7 +1491,8 @@ function getPublicRoomsSummary(viewerUsername?: string) {
   const blockedSet = viewerUsername ? getBlockedSetForUser(viewerUsername) : null;
   return Object.values(activeRooms)
     .filter(r => {
-      if (!r.isPublic || r.state !== 'WAITING' || Object.keys(r.players).length >= 2) return false;
+      const limit = normalizeMaxPlayers(r.maxPlayers);
+      if (!r.isPublic || r.state !== 'WAITING' || Object.keys(r.players).length >= limit) return false;
       if (blockedSet && blockedSet.size > 0) {
         const hasBlockedMember = Object.values(r.players).some(p => blockedSet.has(normalizeUsername(p.username)));
         if (hasBlockedMember) return false;
@@ -1350,6 +1512,7 @@ function getPublicRoomsSummary(viewerUsername?: string) {
         gameMode: r.gameMode || 'WORD_RACE',
         difficulty: r.difficulty || 'MEDIUM',
         stagesCount: r.stagesCount || 50,
+        maxPlayers: normalizeMaxPlayers(r.maxPlayers),
         playerCount: Object.keys(r.players).length,
         createdAt: r.createdAt
       };
@@ -1567,27 +1730,11 @@ app.post('/api/auth/login', async (req, res) => {
     );
   }
 
-  // On-demand Supabase cloud profile hydration if user registered on another instance / device
-  if (!user && db === prodDb && !isTestDbRequest(req) && SERVER_SUPABASE_URL && SERVER_SUPABASE_KEY) {
-    try {
-      const filterQuery = rawTrimmed.includes('@')
-        ? `email=eq.${encodeURIComponent(rawTrimmed)}`
-        : `username=eq.${encodeURIComponent(cleanUser)}`;
-      const sbRes = await fetch(`${SERVER_SUPABASE_URL}/rest/v1/profiles?${filterQuery}&select=*&limit=1`, {
-        headers: {
-          apikey: SERVER_SUPABASE_KEY,
-          Authorization: `Bearer ${SERVER_SUPABASE_KEY}`
-        }
-      });
-      if (sbRes.ok) {
-        const rows = (await sbRes.json()) as any[];
-        if (Array.isArray(rows) && rows.length > 0 && hydrateStateWithSupabaseRows(db, rows)) {
-          const resolvedKey = normalizeUsername(rows[0].username || cleanUser);
-          user = db.users[resolvedKey];
-        }
-      }
-    } catch {
-      // Ignore network error during on-demand hydration
+  // On-demand Supabase cloud profile hydration & merge so stages completed on another device/Vercel sync cleanly
+  if (db === prodDb && !isTestDbRequest(req)) {
+    const hydrated = await hydrateSingleProductionUserFromSupabase(rawTrimmed.includes('@') ? rawTrimmed : cleanUser);
+    if (!user && hydrated) {
+      user = hydrated;
     }
   }
 
@@ -1615,10 +1762,10 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 // Unified Account Sync Bridge (Task 1 & Task 4):
-// - If account does NOT exist yet, registers it with safe initial competitive stats and returns an `authToken`.
+// - If account does NOT exist yet, checks Supabase first (in prod) before registering safe initial stats and returning an `authToken`.
 // - If account ALREADY exists, strictly requires a valid `authToken` for that account OR a valid password!
 // - Rejects any attempt to access or modify another player's account by changing `username`.
-app.post('/api/auth/sync-account', (req, res) => {
+app.post('/api/auth/sync-account', async (req, res) => {
   const {
     id,
     username,
@@ -1653,6 +1800,10 @@ app.post('/api/auth/sync-account', (req, res) => {
     return res.status(403).json({
       error: 'غير مصرح لك بالوصول إلى حساب لاعب آخر أو مزامنته'
     });
+  }
+
+  if (!db.users[cleanUser] && db === prodDb && !isTestDbRequest(req)) {
+    await hydrateSingleProductionUserFromSupabase(cleanUser);
   }
 
   const existingUser = db.users[cleanUser];
@@ -3177,6 +3328,9 @@ app.post('/api/progress/complete-level', (req, res) => {
     earnedXP += achResult.bonusXP;
 
     saveDatabase(db);
+    if (db === prodDb && !isTestDbRequest(req)) {
+      void syncProductionUserToSupabase(user);
+    }
 
     res.json({
       success: true,
@@ -4312,7 +4466,7 @@ app.post('/api/rooms/rejoin', (req, res) => {
 });
 
 app.post('/api/rooms/create', (req, res) => {
-  const { code, roomName, player, categoryId, levelNumber, stagesCount, isPublic, gameMode, difficulty } = req.body || {};
+  const { code, roomName, player, categoryId, levelNumber, stagesCount, isPublic, gameMode, difficulty, maxPlayers } = req.body || {};
   if (!player || !player.id) {
     return res.status(400).json({ success: false, message: 'بيانات اللاعب مفقودة أو غير صالحة' });
   }
@@ -4350,12 +4504,14 @@ app.post('/api/rooms/create', (req, res) => {
   const cleanName = (roomName || `غرفة ${verified.user.displayName?.split(' ')[0] || 'أحمد'}`).trim();
   const resolvedDifficulty = normalizeOnlineDifficulty(difficulty);
   const diffCfg = getOnlineDifficultyConfig(resolvedDifficulty);
+  const resolvedMaxPlayers = normalizeMaxPlayers(maxPlayers);
 
   activeRooms[roomCode] = {
     code: roomCode,
     roomName: cleanName,
     hostId: player.id,
     isPublic: Boolean(isPublic),
+    maxPlayers: resolvedMaxPlayers,
     gameMode: requestedMode,
     difficulty: resolvedDifficulty,
     usedWords: [],
@@ -4380,7 +4536,7 @@ app.post('/api/rooms/create', (req, res) => {
         wordsFound: [],
         streak: 0,
         roundWins: 0,
-        color: '#0ea5e9',
+        color: ONLINE_PLAYER_COLORS[0],
         isReady: true,
         connected: true,
         lastPing: Date.now()
@@ -4447,19 +4603,27 @@ app.post('/api/rooms/join', (req, res) => {
   }
 
   const isHost = room.hostId === targetPlayerId;
+  const maxAllowed = normalizeMaxPlayers(room.maxPlayers);
   const existingCount = Object.keys(room.players).length;
-  if (existingCount >= 2 && !room.players[targetPlayerId]) {
+  if (existingCount >= maxAllowed && !room.players[targetPlayerId]) {
     return res.status(400).json({
       success: false,
-      message: 'الغرفة ممتلئة باللاعبين (الحد الأقصى لاعبان)'
+      message: `الغرفة ممتلئة باللاعبين (الحد الأقصى ${maxAllowed} لاعبين)`
     });
   }
 
-  const existingOther = Object.values(room.players).find(p => p.id !== targetPlayerId);
-  const finalDisplayName =
-    existingOther && existingOther.displayName === player.displayName
-      ? `${player.displayName} (2)`
-      : room.players[targetPlayerId]?.displayName || player.displayName || verified.user.displayName;
+  const baseName = player.displayName || verified.user.displayName;
+  const otherNames = new Set(
+    Object.values(room.players)
+      .filter(p => p.id !== targetPlayerId)
+      .map(p => p.displayName)
+  );
+  let finalDisplayName = room.players[targetPlayerId]?.displayName || baseName;
+  if (!room.players[targetPlayerId] && otherNames.has(baseName)) {
+    finalDisplayName = `${baseName} (${existingCount + 1})`;
+  }
+
+  const seatColor = assignRoomPlayerColor(room, targetPlayerId);
 
   room.players[targetPlayerId] = {
     ...player,
@@ -4472,7 +4636,7 @@ app.post('/api/rooms/join', (req, res) => {
     wordsFound: room.players[targetPlayerId]?.wordsFound || [],
     streak: room.players[targetPlayerId]?.streak || 0,
     roundWins: room.players[targetPlayerId]?.roundWins || 0,
-    color: isHost ? '#0ea5e9' : '#ec4899',
+    color: seatColor,
     isReady: true,
     connected: true,
     lastPing: Date.now()
@@ -4603,11 +4767,10 @@ function evaluateSpeedModeDeadlines(room: ActiveRoom, nowMs = Date.now()) {
       const newDeadline = nowMs + SPEED_MODE_TURN_MS;
       room.playerDeadlines[pid] = newDeadline;
 
-      // Pick a secret letter ONLY for the other player (never exposed to the timed-out player!)
-      const otherPlayerId = playerIds.find(id => id !== pid);
-      if (!otherPlayerId) continue;
+      // Pick a secret letter ONLY for opposing players (never exposed to the timed-out player!)
+      const otherPlayerIds = playerIds.filter(id => id !== pid);
+      if (otherPlayerIds.length === 0) continue;
 
-      const revealedCell = pickSecretLetterForBeneficiary(room, otherPlayerId);
       const sockets = roomSockets[room.code];
 
       // 1) Notify timed-out player ONLY that their 20s expired (NO revealed cell coordinates/word!)
@@ -4625,20 +4788,23 @@ function evaluateSpeedModeDeadlines(room: ActiveRoom, nowMs = Date.now()) {
         );
       }
 
-      // 2) Send the secret revealed letter EXCLUSIVELY to the opposing player
-      const beneficiaryWs = sockets?.get(otherPlayerId);
-      if (beneficiaryWs && beneficiaryWs.readyState === WebSocket.OPEN) {
-        beneficiaryWs.send(
-          JSON.stringify({
-            type: 'SECRET_LETTER_REVEALED',
-            payload: {
-              timedOutPlayerId: pid,
-              timedOutPlayerName: room.players[pid]?.displayName || 'الخصم',
-              cell: revealedCell,
-              playerDeadlines: { ...room.playerDeadlines }
-            }
-          })
-        );
+      // 2) Send a secret revealed letter EXCLUSIVELY to each opposing player
+      for (const otherPlayerId of otherPlayerIds) {
+        const revealedCell = pickSecretLetterForBeneficiary(room, otherPlayerId);
+        const beneficiaryWs = sockets?.get(otherPlayerId);
+        if (beneficiaryWs && beneficiaryWs.readyState === WebSocket.OPEN) {
+          beneficiaryWs.send(
+            JSON.stringify({
+              type: 'SECRET_LETTER_REVEALED',
+              payload: {
+                timedOutPlayerId: pid,
+                timedOutPlayerName: room.players[pid]?.displayName || 'الخصم',
+                cell: revealedCell,
+                playerDeadlines: { ...room.playerDeadlines }
+              }
+            })
+          );
+        }
       }
     }
   }
@@ -4729,7 +4895,8 @@ function claimWordInRoom(
           payload: {
             word: placement.displayWord,
             claimedBy: placement.foundBy,
-            claimedByName: claimerName
+            claimedByName: claimerName,
+            room: sanitizeRoomForClient(room)
           }
         })
       );
@@ -4849,6 +5016,9 @@ function claimWordInRoom(
         if (!u.achievements.includes('online_warrior')) {
           u.achievements.push('online_warrior');
         }
+        if (db === prodDb) {
+          void syncProductionUserToSupabase(u);
+        }
       }
     });
     saveDatabase(db);
@@ -4964,6 +5134,11 @@ app.post('/api/rooms/add-rival', (req, res) => {
     return res.status(403).json({ success: false, message: 'فقط مضيف الغرفة يمكنه إضافة منافس' });
   }
 
+  const maxAllowed = normalizeMaxPlayers(room.maxPlayers);
+  if (Object.keys(room.players).length >= maxAllowed) {
+    return res.status(400).json({ success: false, message: 'الغرفة ممتلئة بالفعل' });
+  }
+
   const rivalNames = ['جاسم الكويتي', 'ضاري المطيري', 'دلال العتيبي', 'فهد الرشيدي', 'سارة الدوسري'];
   const rivalAvatars = [
     '/assets/images/avatar_kuwaiti_girl_1794404783186.jpg',
@@ -4985,7 +5160,7 @@ app.post('/api/rooms/add-rival', (req, res) => {
     wordsFound: [],
     streak: 0,
     roundWins: 0,
-    color: '#ec4899',
+    color: assignRoomPlayerColor(room, botId),
     isReady: true,
     connected: true,
     lastPing: Date.now()
@@ -5278,10 +5453,19 @@ app.post('/api/rooms/claim-word', (req, res) => {
 
   const claimed = claimWordInRoom(cleanCode, word, memberPlayer.id, undefined, cells);
   if (!claimed) {
+    const cleanTargetErr = cleanArabic(word);
+    const existPlacement = room.wordPlacements.find(p => p.word === cleanTargetErr);
+    const claimerName = existPlacement?.foundBy
+      ? room.players[existPlacement.foundBy]?.displayName || 'الخصم'
+      : undefined;
     return res.status(400).json({
       success: false,
       claimed: false,
-      error: 'الكلمة غير صحيحة أو تم التقاطها مسبقاً',
+      claimedBy: existPlacement?.foundBy,
+      claimedByName: claimerName,
+      error: claimerName
+        ? `هذه الكلمة صادها «${claimerName}» قبلك وانحسبت له!`
+        : 'الكلمة غير صحيحة أو تم التقاطها مسبقاً',
       room: sanitizeRoomForClient(room)
     });
   }
@@ -5657,7 +5841,7 @@ wss.on('connection', (ws, req) => {
         }
 
         case 'ROOM_CREATE': {
-          const { code, roomName, player, categoryId, levelNumber, stagesCount, isPublic, gameMode, difficulty } = payload || {};
+          const { code, roomName, player, categoryId, levelNumber, stagesCount, isPublic, gameMode, difficulty, maxPlayers } = payload || {};
           if (!player || !player.id) {
             ws.send(JSON.stringify({ type: 'ERROR', payload: { message: 'بيانات اللاعب غير صالحة' } }));
             break;
@@ -5701,12 +5885,14 @@ wss.on('connection', (ws, req) => {
           registerSocketUsername(verifiedUser);
           const resolvedDifficulty = normalizeOnlineDifficulty(difficulty);
           const diffCfg = getOnlineDifficultyConfig(resolvedDifficulty);
+          const resolvedMaxPlayers = normalizeMaxPlayers(maxPlayers);
 
           activeRooms[roomCode] = {
             code: roomCode,
             roomName: (roomName || `غرفة ${player.displayName?.split(' ')[0] || 'أحمد'}`).trim(),
             hostId: player.id,
             isPublic: Boolean(isPublic),
+            maxPlayers: resolvedMaxPlayers,
             gameMode: requestedMode,
             difficulty: resolvedDifficulty,
             usedWords: [],
@@ -5730,7 +5916,7 @@ wss.on('connection', (ws, req) => {
                 wordsFound: [],
                 streak: 0,
                 roundWins: 0,
-                color: '#0ea5e9',
+                color: ONLINE_PLAYER_COLORS[0],
                 isReady: true,
                 connected: true,
                 lastPing: Date.now()
@@ -5757,7 +5943,7 @@ wss.on('connection', (ws, req) => {
         }
 
         case 'QUICK_MATCH': {
-          const { player, categoryId, roomName, stagesCount, gameMode, difficulty } = payload || {};
+          const { player, categoryId, roomName, stagesCount, gameMode, difficulty, maxPlayers } = payload || {};
           if (!player || !player.id) break;
           const verifiedUser = verifySocketCaller(msg, player.username);
           if (!verifiedUser) break;
@@ -5774,6 +5960,7 @@ wss.on('connection', (ws, req) => {
           const requestedStagesCount = normalizeStagesCount(stagesCount);
           const resolvedDifficulty = normalizeOnlineDifficulty(difficulty);
           const diffCfg = getOnlineDifficultyConfig(resolvedDifficulty);
+          const requestedMaxPlayers = normalizeMaxPlayers(maxPlayers);
 
           const preferredCat = categoryId || 'kuwait_heritage';
 
@@ -5784,7 +5971,7 @@ wss.on('connection', (ws, req) => {
               r.state === 'WAITING' &&
               r.gameMode === requestedMode &&
               normalizeStagesCount(r.stagesCount) === requestedStagesCount &&
-              Object.keys(r.players).length < 2 &&
+              Object.keys(r.players).length < normalizeMaxPlayers(r.maxPlayers) &&
               !r.players[player.id] &&
               !Object.values(r.players).some(p => isUserBlockedEitherWay(verifiedUser, p.username))
           );
@@ -5802,11 +5989,12 @@ wss.on('connection', (ws, req) => {
             boundRoomCode = code;
             boundPlayerId = player.id;
 
-            const hostPlayer = Object.values(matchedRoom.players)[0];
-            const finalDisplayName =
-              hostPlayer && hostPlayer.displayName === player.displayName
-                ? `${player.displayName} (2)`
-                : player.displayName;
+            const existingCount = Object.keys(matchedRoom.players).length;
+            const existingNames = new Set(Object.values(matchedRoom.players).map(p => p.displayName));
+            const finalDisplayName = existingNames.has(player.displayName)
+              ? `${player.displayName} (${existingCount + 1})`
+              : player.displayName;
+            const seatColor = assignRoomPlayerColor(matchedRoom, player.id);
 
             matchedRoom.players[player.id] = {
               ...player,
@@ -5818,7 +6006,7 @@ wss.on('connection', (ws, req) => {
               wordsFound: [],
               streak: 0,
               roundWins: 0,
-              color: '#ec4899',
+              color: seatColor,
               isReady: true,
               connected: true,
               lastPing: Date.now()
@@ -5829,23 +6017,35 @@ wss.on('connection', (ws, req) => {
             }
             roomSockets[code].set(player.id, ws);
 
-            // Generate authoritative board for the room's category & difficulty and start immediately
-            assignAuthoritativeBoardToRoom(matchedRoom);
-            matchedRoom.state = 'PLAYING';
-            matchedRoom.startedAt = Date.now();
-            matchedRoom.roundNumber = 1;
-            startSpeedModeForRoom(matchedRoom);
+            const roomCapacity = normalizeMaxPlayers(matchedRoom.maxPlayers);
+            if (Object.keys(matchedRoom.players).length >= roomCapacity) {
+              assignAuthoritativeBoardToRoom(matchedRoom);
+              matchedRoom.state = 'PLAYING';
+              matchedRoom.startedAt = Date.now();
+              matchedRoom.roundNumber = 1;
+              startSpeedModeForRoom(matchedRoom);
 
-            const sanitizedMatched = sanitizeRoomForClient(matchedRoom);
-            broadcastToRoom(code, {
-              type: 'ROOM_UPDATED',
-              payload: { room: sanitizedMatched }
-            });
+              const sanitizedMatched = sanitizeRoomForClient(matchedRoom);
+              broadcastToRoom(code, {
+                type: 'ROOM_UPDATED',
+                payload: { room: sanitizedMatched }
+              });
 
-            broadcastToRoom(code, {
-              type: 'GAME_STARTED',
-              payload: { room: sanitizedMatched }
-            });
+              broadcastToRoom(code, {
+                type: 'GAME_STARTED',
+                payload: { room: sanitizedMatched }
+              });
+            } else {
+              const sanitizedMatched = sanitizeRoomForClient(matchedRoom);
+              ws.send(JSON.stringify({
+                type: 'ROOM_CREATED',
+                payload: { room: sanitizedMatched, isQuickMatchWaiting: true }
+              }));
+              broadcastToRoom(code, {
+                type: 'ROOM_UPDATED',
+                payload: { room: sanitizedMatched }
+              });
+            }
 
             broadcastPublicRooms();
           } else {
@@ -5858,6 +6058,7 @@ wss.on('connection', (ws, req) => {
               roomName: (roomName || `غرفة ${player.displayName?.split(' ')[0] || 'أحمد'}`).trim(),
               hostId: player.id,
               isPublic: true,
+              maxPlayers: requestedMaxPlayers,
               gameMode: requestedMode,
               difficulty: resolvedDifficulty,
               usedWords: [],
@@ -5881,7 +6082,7 @@ wss.on('connection', (ws, req) => {
                   wordsFound: [],
                   streak: 0,
                   roundWins: 0,
-                  color: '#0ea5e9',
+                  color: ONLINE_PLAYER_COLORS[0],
                   isReady: true,
                   connected: true,
                   lastPing: Date.now()
@@ -5917,6 +6118,10 @@ wss.on('connection', (ws, req) => {
             ws.send(JSON.stringify({ type: 'ERROR', payload: { message: 'فقط مضيف الغرفة يمكنه إضافة منافس' } }));
             break;
           }
+          if (Object.keys(room.players).length >= normalizeMaxPlayers(room.maxPlayers)) {
+            ws.send(JSON.stringify({ type: 'ERROR', payload: { message: 'الغرفة ممتلئة بالفعل' } }));
+            break;
+          }
 
           const rivalNames = ['جاسم الكويتي', 'ضاري المطيري', 'دلال العتيبي', 'فهد الرشيدي', 'سارة الدوسري'];
           const rivalAvatars = [
@@ -5939,7 +6144,7 @@ wss.on('connection', (ws, req) => {
             wordsFound: [],
             streak: 0,
             roundWins: 0,
-            color: '#ec4899',
+            color: assignRoomPlayerColor(room, botId),
             isReady: true,
             connected: true,
             lastPing: Date.now()
@@ -6027,11 +6232,12 @@ wss.on('connection', (ws, req) => {
             return;
           }
 
+          const maxAllowed = normalizeMaxPlayers(room.maxPlayers);
           const existingPlayerCount = Object.keys(room.players).length;
-          if (existingPlayerCount >= 2 && !room.players[player.id]) {
+          if (existingPlayerCount >= maxAllowed && !room.players[player.id]) {
             ws.send(JSON.stringify({
               type: 'ERROR',
-              payload: { message: 'الغرفة مكتملة (لاعبان كحد أقصى)' }
+              payload: { message: `الغرفة مكتملة (${maxAllowed} لاعبين كحد أقصى)` }
             }));
             return;
           }
@@ -6051,13 +6257,17 @@ wss.on('connection', (ws, req) => {
           boundPlayerId = player.id;
           registerSocketUsername(verifiedUser);
 
-          const existingHost = Object.values(room.players).find(p => p.id !== player.id);
+          const otherNames = new Set(
+            Object.values(room.players)
+              .filter(p => p.id !== player.id)
+              .map(p => p.displayName)
+          );
           const finalDisplayName =
-            existingHost && existingHost.displayName === player.displayName
-              ? `${player.displayName} (2)`
-              : player.displayName;
+            !room.players[player.id] && otherNames.has(player.displayName)
+              ? `${player.displayName} (${existingPlayerCount + 1})`
+              : room.players[player.id]?.displayName || player.displayName;
 
-          const playerColor = player.id === room.hostId ? '#0ea5e9' : '#ec4899';
+          const playerColor = assignRoomPlayerColor(room, player.id);
           room.players[player.id] = {
             ...player,
             username: verifiedUser,
@@ -6085,8 +6295,8 @@ wss.on('connection', (ws, req) => {
             payload: { room: sanitized }
           });
 
-          // If this is a Public Room and 2 players are now present, auto-start the Live Word Race!
-          if (room.isPublic && Object.keys(room.players).length >= 2 && room.state === 'WAITING') {
+          // If this is a Public Room and the room reached its player capacity, auto-start the Live Word Race!
+          if (room.isPublic && Object.keys(room.players).length >= maxAllowed && room.state === 'WAITING') {
             assignAuthoritativeBoardToRoom(room);
             room.state = 'PLAYING';
             room.startedAt = Date.now();
@@ -6337,7 +6547,7 @@ wss.on('connection', (ws, req) => {
             break;
           }
 
-          const target = Object.values(room.players).find(p => p.id !== verifiedPlayerId);
+          const opponents = Object.values(room.players).filter(p => p.id !== verifiedPlayerId);
 
           if (!roomActiveShields[room.code]) {
             roomActiveShields[room.code] = {};
@@ -6352,6 +6562,8 @@ wss.on('connection', (ws, req) => {
                 senderId: verifiedPlayerId,
                 senderName: sender.displayName,
                 targetId: verifiedPlayerId,
+                targetIds: [verifiedPlayerId],
+                blockedByIds: [],
                 targetName: sender.displayName,
                 blockedByShield: false,
                 stolenAmount: 0,
@@ -6361,33 +6573,71 @@ wss.on('connection', (ws, req) => {
             break;
           }
 
-          const hasShield = target && Boolean(roomActiveShields[room.code][target.id]);
-          if (hasShield && target) {
-            roomActiveShields[room.code][target.id] = false;
+          if (cardId === 'CARD_STEAL_POINTS') {
+            const topTarget = [...opponents].sort((a, b) => (b.score || 0) - (a.score || 0))[0];
+            if (topTarget && roomActiveShields[room.code][topTarget.id]) {
+              roomActiveShields[room.code][topTarget.id] = false;
+              broadcastToRoom(room.code, {
+                type: 'BATTLE_CARD_APPLIED',
+                payload: {
+                  cardId,
+                  senderId: verifiedPlayerId,
+                  senderName: sender.displayName,
+                  targetId: topTarget.id,
+                  targetIds: [],
+                  blockedByIds: [topTarget.id],
+                  targetName: topTarget.displayName,
+                  blockedByShield: true,
+                  stolenAmount: 0,
+                  room: sanitizeRoomForClient(room)
+                }
+              });
+              break;
+            }
+
+            let stolenAmount = 0;
+            if (topTarget) {
+              stolenAmount = Math.min(100, Math.max(0, topTarget.score || 0));
+              topTarget.score = Math.max(0, (topTarget.score || 0) - stolenAmount);
+              topTarget.totalScore = Math.max(0, (topTarget.totalScore ?? topTarget.score) - stolenAmount);
+              sender.score = (sender.score || 0) + stolenAmount;
+              sender.totalScore = (sender.totalScore ?? sender.score) + stolenAmount;
+            }
+
             broadcastToRoom(room.code, {
               type: 'BATTLE_CARD_APPLIED',
               payload: {
                 cardId,
                 senderId: verifiedPlayerId,
                 senderName: sender.displayName,
-                targetId: target.id,
-                targetName: target.displayName,
-                blockedByShield: true,
-                stolenAmount: 0,
+                targetId: topTarget?.id,
+                targetIds: topTarget ? [topTarget.id] : [],
+                blockedByIds: [],
+                targetName: topTarget?.displayName,
+                blockedByShield: false,
+                stolenAmount,
                 room: sanitizeRoomForClient(room)
               }
             });
             break;
           }
 
-          let stolenAmount = 0;
-          if (cardId === 'CARD_STEAL_POINTS' && target) {
-            stolenAmount = Math.min(100, Math.max(0, target.score || 0));
-            target.score = Math.max(0, (target.score || 0) - stolenAmount);
-            target.totalScore = Math.max(0, (target.totalScore ?? target.score) - stolenAmount);
-            sender.score = (sender.score || 0) + stolenAmount;
-            sender.totalScore = (sender.totalScore ?? sender.score) + stolenAmount;
-          }
+          // Debuff attack cards (CARD_FREEZE_OPPONENT / CARD_SANDSTORM / CARD_BLIND_WORDS) apply to all unshielded opponents
+          const targetIds: string[] = [];
+          const blockedByIds: string[] = [];
+          opponents.forEach(opp => {
+            if (roomActiveShields[room.code][opp.id]) {
+              roomActiveShields[room.code][opp.id] = false;
+              blockedByIds.push(opp.id);
+            } else {
+              targetIds.push(opp.id);
+            }
+          });
+
+          const primaryTarget =
+            opponents.find(o => targetIds.includes(o.id)) ||
+            opponents.find(o => blockedByIds.includes(o.id)) ||
+            opponents[0];
 
           broadcastToRoom(room.code, {
             type: 'BATTLE_CARD_APPLIED',
@@ -6395,10 +6645,15 @@ wss.on('connection', (ws, req) => {
               cardId,
               senderId: verifiedPlayerId,
               senderName: sender.displayName,
-              targetId: target?.id,
-              targetName: target?.displayName,
-              blockedByShield: false,
-              stolenAmount,
+              targetId: primaryTarget?.id,
+              targetIds,
+              blockedByIds,
+              targetName:
+                targetIds.length > 1
+                  ? 'جميع المنافسين'
+                  : primaryTarget?.displayName,
+              blockedByShield: blockedByIds.length > 0 && targetIds.length === 0,
+              stolenAmount: 0,
               room: sanitizeRoomForClient(room)
             }
           });

@@ -23,7 +23,7 @@ import { FriendsModal } from '../components/FriendsModal';
 import { StoreModal } from '../components/StoreModal';
 import { ReportPlayerModal } from '../components/ReportPlayerModal';
 import { checkTextModeration } from '../engine/moderation';
-import { realtimeSync } from '../services/realtimeSync';
+import { realtimeSync, assignSeatColor, ONLINE_PLAYER_COLORS } from '../services/realtimeSync';
 import {
   Wifi,
   Users,
@@ -87,6 +87,7 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
   const [categoryDropdownOpen, setCategoryDropdownOpen] = useState<boolean>(false);
   const [stagesCount, setStagesCount] = useState<5 | 10 | 20 | 50>(50);
   const [difficulty, setDifficulty] = useState<OnlineDifficulty>('MEDIUM');
+  const [maxPlayers, setMaxPlayers] = useState<2 | 3 | 4>(4);
   const [isPublicRoom, setIsPublicRoom] = useState<boolean>(false); // false = خاصة (selected in screenshot), true = عامة
   const [selectedGameMode, setSelectedGameMode] = useState<OnlineGameModeId>('WORD_RACE');
   const [showStoreModal, setShowStoreModal] = useState<boolean>(false);
@@ -126,6 +127,7 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
   activeRoomRef.current = activeRoom;
   const isStartingMatchRef = useRef(false);
   const hasStartedGameRef = useRef(false);
+  const isCheckingCloudJoinRef = useRef(false);
 
   // Reset match start flags when active room changes
   useEffect(() => {
@@ -288,6 +290,10 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
             sendDirectRoomInviteToFriend(targetFriend, payload.room.code, payload.room.roomName);
           }
         } else if (type === 'ERROR') {
+          if (isCheckingCloudJoinRef.current) {
+            // Do not abort while Supabase Cloud Room Snapshot lookup is still in progress
+            return;
+          }
           setIsSubmitting(false);
           isStartingMatchRef.current = false;
           sounds.playError();
@@ -439,6 +445,7 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
                 levelNumber: 1,
                 stagesCount,
                 difficulty,
+                maxPlayers,
                 isPublic: false,
                 gameMode: isSpeedModeUnlocked ? selectedGameMode : 'WORD_RACE'
               }
@@ -497,7 +504,7 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
     };
   }, []);
 
-  const saveRoomLocally = (roomObj: OnlineRoom) => {
+  const saveRoomLocally = (roomObj: OnlineRoom): Promise<void> => {
     try {
       const raw = localStorage.getItem('fatteshha_local_rooms_v1');
       const all: Record<string, OnlineRoom> = raw ? JSON.parse(raw) : {};
@@ -507,7 +514,7 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
     } catch {
       // Ignore
     }
-    void realtimeSync.saveCloudRoomSnapshot(roomObj);
+    return realtimeSync.saveCloudRoomSnapshot(roomObj);
   };
 
   const getRoomLocally = (code: string): OnlineRoom | null => {
@@ -555,6 +562,7 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
                 roomName: cleanRoomName,
                 stagesCount,
                 difficulty,
+                maxPlayers,
                 gameMode: chosenMode
               }
             })
@@ -584,6 +592,7 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
                 levelNumber: 1,
                 stagesCount,
                 difficulty,
+                maxPlayers,
                 isPublic: true,
                 gameMode: chosenMode
               })
@@ -616,6 +625,7 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
             roomName: cleanRoomName,
             hostId: currentPlayer.id,
             isPublic: true,
+            maxPlayers,
             gameMode: chosenMode,
             difficulty,
             usedWords: [],
@@ -637,7 +647,7 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
                 wordsFound: [],
                 streak: 0,
                 roundWins: 0,
-                color: '#0ea5e9',
+                color: ONLINE_PLAYER_COLORS[0],
                 isReady: true,
                 connected: true,
                 lastActive: Date.now(),
@@ -677,6 +687,7 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
               levelNumber: 1,
               stagesCount,
               difficulty,
+              maxPlayers,
               isPublic: false,
               gameMode: chosenMode
             }
@@ -710,6 +721,7 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
             levelNumber: 1,
             stagesCount,
             difficulty,
+            maxPlayers,
             isPublic: false,
             gameMode: chosenMode
           })
@@ -742,6 +754,7 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
         roomName: cleanRoomName,
         hostId: currentPlayer.id,
         isPublic: false,
+        maxPlayers,
         gameMode: chosenMode,
         difficulty,
         usedWords: [],
@@ -763,7 +776,7 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
             wordsFound: [],
             streak: 0,
             roundWins: 0,
-            color: '#0ea5e9',
+            color: ONLINE_PLAYER_COLORS[0],
             isReady: true,
             connected: true,
             lastActive: Date.now(),
@@ -774,7 +787,7 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
         createdAt: Date.now(),
         chatMessages: []
       };
-      saveRoomLocally(localRoom);
+      await saveRoomLocally(localRoom);
       completed = true;
       setActiveRoom(localRoom);
       setErrorMsg('');
@@ -794,6 +807,7 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
     }
 
     setIsSubmitting(true);
+    isCheckingCloudJoinRef.current = true;
     const currentPlayer = getPlayerPayload();
     let completed = false;
 
@@ -805,33 +819,60 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
       wordsFound: [],
       streak: 0,
       roundWins: 0,
-      color: '#ec4899',
+      color: ONLINE_PLAYER_COLORS[1],
       isReady: true,
       connected: true,
       lastActive: Date.now(),
       lastPing: Date.now()
     };
 
-    const mergeGuestIntoRoom = (baseRoom: OnlineRoom): OnlineRoom => {
+    const mergeGuestIntoRoom = (baseRoom: OnlineRoom): { room: OnlineRoom | null; error?: string } => {
+      const existingPlayers = baseRoom.players || {};
+      const maxAllowed = Number(baseRoom.maxPlayers) >= 2 ? Math.min(4, Number(baseRoom.maxPlayers)) : 2;
       let guestId = currentPlayer.id;
       if (guestId === baseRoom.hostId) {
-        guestId = `${guestId}_p2`;
+        let slotIdx = 2;
+        while (existingPlayers[`${currentPlayer.id}_p${slotIdx}`]) {
+          slotIdx++;
+        }
+        guestId = `${currentPlayer.id}_p${slotIdx}`;
         tabPlayerIdRef.current = guestId;
         sessionStorage.setItem('fatteshha_online_tab_id', guestId);
       }
-      const existingHost = Object.values(baseRoom.players || {}).find(p => p.id !== guestId);
-      const safeName =
-        existingHost && existingHost.displayName === guestPlayer.displayName
-          ? `${guestPlayer.displayName} (2)`
-          : guestPlayer.displayName;
+
+      const alreadyJoined = Boolean(existingPlayers[guestId]);
+      if (!alreadyJoined && Object.keys(existingPlayers).length >= maxAllowed) {
+        return {
+          room: null,
+          error: `الغرفة ممتلئة باللاعبين (الحد الأقصى ${maxAllowed} لاعبين)`
+        };
+      }
+
+      const otherPlayers = Object.values(existingPlayers).filter(p => p.id !== guestId);
+      const existingNames = new Set(otherPlayers.map(p => p.displayName));
+      let safeName = guestPlayer.displayName;
+      if (existingNames.has(safeName)) {
+        let suffix = otherPlayers.length + 1;
+        while (existingNames.has(`${guestPlayer.displayName} (${suffix})`)) {
+          suffix++;
+        }
+        safeName = `${guestPlayer.displayName} (${suffix})`;
+      }
+
+      const seatColor =
+        existingPlayers[guestId]?.color || assignSeatColor(existingPlayers, false);
+
       return {
-        ...baseRoom,
-        players: {
-          ...(baseRoom.players || {}),
-          [guestId]: {
-            ...guestPlayer,
-            id: guestId,
-            displayName: safeName
+        room: {
+          ...baseRoom,
+          players: {
+            ...existingPlayers,
+            [guestId]: {
+              ...guestPlayer,
+              id: guestId,
+              displayName: safeName,
+              color: seatColor
+            }
           }
         }
       };
@@ -894,15 +935,22 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
         })
       });
       const contentType = res.headers.get('content-type') || '';
-      if (res.ok && contentType.includes('application/json')) {
+      if (contentType.includes('application/json')) {
         const data = await res.json();
-        if (data.success && data.room) {
+        if (res.ok && data.success && data.room) {
           completed = true;
           setActiveRoom(data.room);
           saveRoomLocally(data.room);
           void realtimeSync.publishToRoom(cleanCode, 'ROOM_UPDATED', { room: data.room }, currentPlayer.id);
           setErrorMsg('');
           setIsSubmitting(false);
+          return;
+        }
+        if (res.status === 400 || res.status === 403) {
+          isCheckingCloudJoinRef.current = false;
+          setIsSubmitting(false);
+          sounds.playError();
+          setErrorMsg(data.message || data.error || 'تعذر الانضمام إلى الغرفة');
           return;
         }
       }
@@ -913,7 +961,15 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
     // D. Check locally stored room (if running on same browser)
     const localRoom = getRoomLocally(cleanCode);
     if (localRoom) {
-      const updatedLocal = mergeGuestIntoRoom(localRoom);
+      const mergeRes = mergeGuestIntoRoom(localRoom);
+      if (!mergeRes.room) {
+        isCheckingCloudJoinRef.current = false;
+        setIsSubmitting(false);
+        sounds.playError();
+        setErrorMsg(mergeRes.error || 'الغرفة ممتلئة باللاعبين');
+        return;
+      }
+      const updatedLocal = mergeRes.room;
       saveRoomLocally(updatedLocal);
       void realtimeSync.publishToRoom(cleanCode, 'ROOM_UPDATED', { room: updatedLocal }, tabPlayerIdRef.current);
       completed = true;
@@ -926,11 +982,20 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
     // E. Check Supabase Cloud Room Snapshot store (works across different phones/TVs on ftsh1.vercel.app even if Host is in WhatsApp!)
     const cloudRoom = await realtimeSync.fetchCloudRoomSnapshot(cleanCode);
     if (cloudRoom) {
-      const updatedCloud = mergeGuestIntoRoom(cloudRoom);
-      saveRoomLocally(updatedCloud);
+      const mergeRes = mergeGuestIntoRoom(cloudRoom);
+      if (!mergeRes.room) {
+        isCheckingCloudJoinRef.current = false;
+        setIsSubmitting(false);
+        sounds.playError();
+        setErrorMsg(mergeRes.error || 'الغرفة ممتلئة باللاعبين');
+        return;
+      }
+      const updatedCloud = mergeRes.room;
+      await saveRoomLocally(updatedCloud);
       void realtimeSync.publishToRoom(cleanCode, 'JOIN_REQUEST', { player: updatedCloud.players[tabPlayerIdRef.current] || guestPlayer }, tabPlayerIdRef.current);
       void realtimeSync.publishToRoom(cleanCode, 'ROOM_UPDATED', { room: updatedCloud }, tabPlayerIdRef.current);
       completed = true;
+      isCheckingCloudJoinRef.current = false;
       setActiveRoom(updatedCloud);
       setErrorMsg('');
       setIsSubmitting(false);
@@ -954,11 +1019,19 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
 
     // If host hasn't responded within 4.2s, do one final cloud snapshot check before showing error
     setTimeout(async () => {
+      isCheckingCloudJoinRef.current = false;
       if (!completed && !activeRoomRef.current) {
         const retryCloud = await realtimeSync.fetchCloudRoomSnapshot(cleanCode);
         if (retryCloud && !completed && !activeRoomRef.current) {
-          const updatedCloud = mergeGuestIntoRoom(retryCloud);
-          saveRoomLocally(updatedCloud);
+          const mergeRes = mergeGuestIntoRoom(retryCloud);
+          if (!mergeRes.room) {
+            setIsSubmitting(false);
+            sounds.playError();
+            setErrorMsg(mergeRes.error || 'الغرفة ممتلئة باللاعبين');
+            return;
+          }
+          const updatedCloud = mergeRes.room;
+          await saveRoomLocally(updatedCloud);
           void realtimeSync.publishToRoom(cleanCode, 'ROOM_UPDATED', { room: updatedCloud }, tabPlayerIdRef.current);
           completed = true;
           setActiveRoom(updatedCloud);
@@ -989,6 +1062,7 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
           levelNumber: 1,
           stagesCount,
           difficulty,
+          maxPlayers,
           isPublic: true
         })
       });
@@ -1009,6 +1083,7 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
       roomName: `غرفة ${defaultFirstName}`,
       hostId: getPlayerPayload().id,
       isPublic: true,
+      maxPlayers,
       gameMode: 'WORD_RACE',
       difficulty,
       usedWords: [],
@@ -1029,7 +1104,7 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
           wordsFound: [],
           streak: 0,
           roundWins: 0,
-          color: '#0ea5e9',
+          color: ONLINE_PLAYER_COLORS[0],
           isReady: true,
           connected: true,
           lastActive: Date.now(),
@@ -1152,7 +1227,7 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
 
     if (playersCount < 2) {
       sounds.playError();
-      setErrorMsg('يجب انتظار انضمام اللاعب الثاني أو الضغط على «إدخال منافس مباشر الآن»');
+      setErrorMsg('يجب انتظار انضمام لاعب ثانٍ على الأقل أو الضغط على «إدخال منافس مباشر الآن»');
       return;
     }
 
@@ -1284,7 +1359,7 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
         wordsFound: [],
         streak: 0,
         roundWins: 0,
-        color: '#ec4899',
+        color: assignSeatColor(activeRoom.players, false),
         isReady: true,
         connected: true,
         lastActive: now,
@@ -1327,23 +1402,38 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
       if (senderId === myId) return; // ignore self-messages
 
       if (type === 'JOIN_REQUEST' && isHost) {
-        // A second player joined our room over the cloud!
+        // A challenger (2nd, 3rd, or 4th player) joined our room over the cloud!
         const guest: OnlineRoomPlayer = payload.player;
         setActiveRoom((cur) => {
           if (!cur || cur.code !== roomCode) return cur;
-          const guestId = guest.id === cur.hostId ? `${guest.id}_p2` : guest.id;
-          const hostPlayer = cur.players[cur.hostId] || Object.values(cur.players)[0];
-          const safeDisplayName =
-            hostPlayer && hostPlayer.displayName === guest.displayName
-              ? `${guest.displayName} (2)`
-              : guest.displayName;
+          const maxAllowed = Number(cur.maxPlayers) >= 2 ? Math.min(4, Number(cur.maxPlayers)) : 2;
+          let guestId = guest.id === cur.hostId ? `${guest.id}_p2` : guest.id;
+          const alreadyExists = Boolean(cur.players[guestId]);
+          if (!alreadyExists && Object.keys(cur.players).length >= maxAllowed) {
+            void realtimeSync.publishToRoom(roomCode, 'ROOM_UPDATED', { room: cur }, myId);
+            return cur;
+          }
+          const existingNames = new Set(
+            Object.values(cur.players)
+              .filter(p => p.id !== guestId)
+              .map(p => p.displayName)
+          );
+          let safeDisplayName = guest.displayName;
+          if (existingNames.has(safeDisplayName)) {
+            let suffix = Object.keys(cur.players).length + 1;
+            while (existingNames.has(`${guest.displayName} (${suffix})`)) {
+              suffix++;
+            }
+            safeDisplayName = `${guest.displayName} (${suffix})`;
+          }
+          const seatColor = cur.players[guestId]?.color || assignSeatColor(cur.players, false);
           const nextPlayers = {
             ...cur.players,
             [guestId]: {
               ...guest,
               id: guestId,
               displayName: safeDisplayName,
-              color: '#ec4899',
+              color: seatColor,
               isHost: false,
               isReady: true,
               connected: true,
@@ -1356,7 +1446,7 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
             players: nextPlayers
           };
           saveRoomLocally(nextRoom);
-          // Broadcast the full updated room back to the guest
+          // Broadcast the full updated room back to all guests
           void realtimeSync.publishToRoom(roomCode, 'ROOM_UPDATED', { room: nextRoom }, myId);
           sounds.playTap();
           return nextRoom;
@@ -1415,9 +1505,9 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
       // Cloud snapshot poll (crucial when Host returns from WhatsApp after sending the room code!)
       const cloudSnap = await realtimeSync.fetchCloudRoomSnapshot(roomCode);
       if (cloudSnap && cloudSnap.code === roomCode) {
-        const curPlayersCount = Object.keys(activeRoomRef.current?.players || {}).length;
-        const snapPlayersCount = Object.keys(cloudSnap.players || {}).length;
-        if (snapPlayersCount > curPlayersCount || cloudSnap.state === 'PLAYING') {
+        const curPlayerKeys = Object.keys(activeRoomRef.current?.players || {}).sort().join(',');
+        const snapPlayerKeys = Object.keys(cloudSnap.players || {}).sort().join(',');
+        if (snapPlayerKeys !== curPlayerKeys || cloudSnap.state === 'PLAYING') {
           setActiveRoom(cloudSnap);
         }
         if (
@@ -1471,8 +1561,11 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
     const isHost = activeRoom.hostId === myId;
     const playerList = Object.values(activeRoom.players);
     const hostPlayer = activeRoom.players[activeRoom.hostId] || playerList.find(p => p.isHost) || playerList[0];
-    const secondPlayer = playerList.find(p => p.id !== hostPlayer?.id);
-    const isRoomFull = playerList.length >= 2;
+    const guestPlayers = playerList.filter(p => p.id !== hostPlayer?.id);
+    const orderedPlayers = hostPlayer ? [hostPlayer, ...guestPlayers] : playerList;
+    const roomMaxPlayers = Math.min(4, Math.max(2, activeRoom.maxPlayers || Math.max(2, orderedPlayers.length)));
+    const canStartGame = orderedPlayers.length >= 2;
+    const isRoomFull = orderedPlayers.length >= roomMaxPlayers;
     const roomCategoryName = getCategoryName(activeRoom.categoryId);
 
     return (
@@ -1629,12 +1722,12 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
             </button>
           </div>
 
-          {/* 2. PLAYERS IN ROOM (1 OF 2) WITH 2 DISTINCT CARDS */}
+          {/* 2. PLAYERS IN ROOM (UP TO 4 PLAYERS WITH DISTINCT SEAT COLORS) */}
           <div className="text-right">
             <div className="flex items-center justify-between mb-2.5 px-1">
               <span className="text-xs sm:text-sm font-bold text-slate-300 flex items-center gap-1.5">
                 <Users className="w-4 h-4 text-sky-400" />
-                <span>اللاعبون في الغرفة ({playerList.length} من 2):</span>
+                <span>اللاعبون في الغرفة ({orderedPlayers.length} من {roomMaxPlayers}):</span>
               </span>
               <button
                 onClick={handleLeaveWaitingRoom}
@@ -1646,147 +1739,137 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
             </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              {/* Host Player Card (Right Card in RTL) */}
-              {hostPlayer && (
-                <div className="rounded-2xl bg-[#061b2b] border border-cyan-500/40 p-3 sm:p-3.5 flex items-center justify-between">
-                  {/* Left (RTL): Badge + Status Dot */}
-                  <div className="flex flex-col items-start gap-2">
-                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-amber-500/20 text-amber-300 border border-amber-400/40 text-[10px] font-black">
-                      <Crown className="w-3 h-3 text-amber-300" />
-                      <span>المضيف</span>
-                    </span>
-                    <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 shadow-[0_0_8px_#34d399]" />
-                  </div>
+              {Array.from({ length: roomMaxPlayers }).map((_, slotIndex) => {
+                const slotPlayer = orderedPlayers[slotIndex];
+                const seatColor = slotPlayer?.color || ONLINE_PLAYER_COLORS[slotIndex % ONLINE_PLAYER_COLORS.length];
+                const isSlotHost = slotPlayer && slotPlayer.id === hostPlayer?.id;
 
-                  {/* Right (RTL): Info + Avatar */}
-                  <div className="flex items-center gap-3">
-                    <div className="text-right">
-                      <div className="text-sm sm:text-base font-black text-white">
-                        {hostPlayer.displayName || 'ضيف فتشها'}
-                      </div>
-                      <div className="text-[11px] font-mono text-slate-400" dir="ltr">
-                        #{hostPlayer.username || activeRoom.code.slice(-3) || '981'}
-                      </div>
-                      <div className="text-[11px] font-bold text-amber-300 flex items-center gap-1 justify-end mt-0.5">
-                        <span>رئيس الغرفة</span>
-                        <Zap className="w-3 h-3 fill-amber-400 text-amber-400" />
-                      </div>
-                      {!isHost && user?.username && hostPlayer.username && (
-                        <div className="flex items-center gap-1 justify-end mt-1">
-                          <button
-                            type="button"
-                            onClick={() =>
-                              setReportTarget({
-                                username: hostPlayer.username,
-                                displayName: hostPlayer.displayName || 'المضيف',
-                                roomCode: activeRoom.code,
-                                context: 'ONLINE_LOBBY'
-                              })
-                            }
-                            className="p-1 rounded-lg bg-slate-900 hover:bg-rose-500/20 text-slate-400 hover:text-rose-300 border border-slate-800 cursor-pointer"
-                            title="إبلاغ"
-                          >
-                            <Flag className="w-3 h-3" />
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() =>
-                              handleBlockPlayerFromLobby(
-                                hostPlayer.username,
-                                hostPlayer.displayName || 'المضيف'
-                              )
-                            }
-                            className="p-1 rounded-lg bg-slate-900 hover:bg-rose-500/20 text-slate-400 hover:text-rose-300 border border-slate-800 cursor-pointer"
-                            title="حظر"
-                          >
-                            <Ban className="w-3 h-3" />
-                          </button>
+                if (!slotPlayer) {
+                  return (
+                    <div
+                      key={`empty-seat-${slotIndex}`}
+                      className="rounded-2xl bg-[#061b2b]/80 border border-dashed p-3 sm:p-3.5 flex items-center justify-center gap-3 min-h-[82px] text-center"
+                      style={{ borderColor: `${seatColor}66` }}
+                    >
+                      <div className="text-right">
+                        <div className="text-xs sm:text-sm font-bold text-sky-200">
+                          بانتظار دخول اللاعب {slotIndex + 1}...
                         </div>
-                      )}
+                        <div className="text-[10px] text-slate-400 mt-0.5">
+                          {orderedPlayers.length >= 2 ? 'مقعد اختياري مفتوح للانضمام' : 'مطلوب للانطلاق'}
+                        </div>
+                      </div>
+                      <div className="relative">
+                        <Users className="w-7 h-7 animate-pulse" style={{ color: seatColor }} />
+                        <Wifi className="w-3.5 h-3.5 text-cyan-300 absolute -top-1 -right-1" />
+                      </div>
                     </div>
-                    <img
-                      src={hostPlayer.avatar || '/assets/images/avatar_kuwaiti_boy_1794404782928.jpg'}
-                      alt={hostPlayer.displayName}
-                      className="w-13 h-13 sm:w-14 sm:h-14 rounded-full object-cover border-2 border-cyan-300 shadow-[0_0_14px_rgba(56,189,248,0.6)]"
-                    />
-                  </div>
-                </div>
-              )}
+                  );
+                }
 
-              {/* Second Player Card (Left Card in RTL) */}
-              {secondPlayer ? (
-                <div className="rounded-2xl bg-[#061b2b] border border-cyan-500/40 p-3 sm:p-3.5 flex items-center justify-between">
-                  <div className="flex flex-col items-start gap-2">
-                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-cyan-500/20 text-cyan-300 border border-cyan-400/40 text-[10px] font-black">
-                      <span>منافس ⚡</span>
-                    </span>
-                    <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 shadow-[0_0_8px_#34d399]" />
-                  </div>
-                  <div className="flex items-center gap-3">
-                    <div className="text-right">
-                      <div className="text-sm sm:text-base font-black text-white">
-                        {secondPlayer.displayName}
-                      </div>
-                      <div className="text-[11px] font-mono text-slate-400" dir="ltr">
-                        #{secondPlayer.username || '772'}
-                      </div>
-                      <div className="text-[11px] font-bold text-emerald-400 flex items-center gap-1 justify-end mt-0.5">
-                        <span>جاهز للمنافسة!</span>
-                        <Check className="w-3 h-3" />
-                      </div>
-                      {isHost && user?.username && secondPlayer.username && !secondPlayer.id.startsWith('bot_') && (
-                        <div className="flex items-center gap-1 justify-end mt-1">
-                          <button
-                            type="button"
-                            onClick={() =>
-                              setReportTarget({
-                                username: secondPlayer.username,
-                                displayName: secondPlayer.displayName,
-                                roomCode: activeRoom.code,
-                                context: 'ONLINE_LOBBY'
-                              })
-                            }
-                            className="p-1 rounded-lg bg-slate-900 hover:bg-rose-500/20 text-slate-400 hover:text-rose-300 border border-slate-800 cursor-pointer"
-                            title="إبلاغ"
-                          >
-                            <Flag className="w-3 h-3" />
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() =>
-                              handleBlockPlayerFromLobby(
-                                secondPlayer.username,
-                                secondPlayer.displayName
-                              )
-                            }
-                            className="p-1 rounded-lg bg-slate-900 hover:bg-rose-500/20 text-slate-400 hover:text-rose-300 border border-slate-800 cursor-pointer"
-                            title="حظر"
-                          >
-                            <Ban className="w-3 h-3" />
-                          </button>
-                        </div>
+                const canModerateThisPlayer =
+                  slotPlayer.id !== myId &&
+                  Boolean(user?.username && slotPlayer.username) &&
+                  !slotPlayer.id.startsWith('bot_') &&
+                  (isHost || isSlotHost);
+
+                return (
+                  <div
+                    key={slotPlayer.id}
+                    className="rounded-2xl bg-[#061b2b] border p-3 sm:p-3.5 flex items-center justify-between"
+                    style={{ borderColor: `${seatColor}88` }}
+                  >
+                    {/* Left (RTL): Badge + Status Dot */}
+                    <div className="flex flex-col items-start gap-2">
+                      {isSlotHost ? (
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-amber-500/20 text-amber-300 border border-amber-400/40 text-[10px] font-black">
+                          <Crown className="w-3 h-3 text-amber-300" />
+                          <span>المضيف</span>
+                        </span>
+                      ) : (
+                        <span
+                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-black border"
+                          style={{
+                            backgroundColor: `${seatColor}26`,
+                            borderColor: `${seatColor}66`,
+                            color: '#f8fafc'
+                          }}
+                        >
+                          <span>لاعب {slotIndex + 1} ⚡</span>
+                        </span>
                       )}
+                      <span
+                        className="w-2.5 h-2.5 rounded-full bg-emerald-400 shadow-[0_0_8px_#34d399]"
+                        title="متصل"
+                      />
                     </div>
-                    <img
-                      src={secondPlayer.avatar}
-                      alt={secondPlayer.displayName}
-                      className="w-13 h-13 sm:w-14 sm:h-14 rounded-full object-cover border-2 border-pink-400 shadow-[0_0_14px_rgba(236,72,153,0.6)]"
-                    />
-                  </div>
-                </div>
-              ) : (
-                <div className="rounded-2xl bg-[#061b2b] border border-cyan-500/40 p-3 sm:p-3.5 flex items-center justify-center gap-3 min-h-[82px] text-center">
-                  <div className="text-right">
-                    <div className="text-xs sm:text-sm font-bold text-sky-200">
-                      بانتظار دخول اللاعبين...
+
+                    {/* Right (RTL): Info + Avatar */}
+                    <div className="flex items-center gap-3">
+                      <div className="text-right">
+                        <div className="text-sm sm:text-base font-black text-white">
+                          {slotPlayer.displayName || 'ضيف فتشها'}
+                        </div>
+                        <div className="text-[11px] font-mono text-slate-400" dir="ltr">
+                          #{slotPlayer.username || activeRoom.code.slice(-3) || '981'}
+                        </div>
+                        {isSlotHost ? (
+                          <div className="text-[11px] font-bold text-amber-300 flex items-center gap-1 justify-end mt-0.5">
+                            <span>رئيس الغرفة</span>
+                            <Zap className="w-3 h-3 fill-amber-400 text-amber-400" />
+                          </div>
+                        ) : (
+                          <div className="text-[11px] font-bold text-emerald-400 flex items-center gap-1 justify-end mt-0.5">
+                            <span>جاهز للمنافسة!</span>
+                            <Check className="w-3 h-3" />
+                          </div>
+                        )}
+                        {canModerateThisPlayer && (
+                          <div className="flex items-center gap-1 justify-end mt-1">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setReportTarget({
+                                  username: slotPlayer.username,
+                                  displayName: slotPlayer.displayName || `لاعب ${slotIndex + 1}`,
+                                  roomCode: activeRoom.code,
+                                  context: 'ONLINE_LOBBY'
+                                })
+                              }
+                              className="p-1 rounded-lg bg-slate-900 hover:bg-rose-500/20 text-slate-400 hover:text-rose-300 border border-slate-800 cursor-pointer"
+                              title="إبلاغ"
+                            >
+                              <Flag className="w-3 h-3" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                handleBlockPlayerFromLobby(
+                                  slotPlayer.username,
+                                  slotPlayer.displayName || `لاعب ${slotIndex + 1}`
+                                )
+                              }
+                              className="p-1 rounded-lg bg-slate-900 hover:bg-rose-500/20 text-slate-400 hover:text-rose-300 border border-slate-800 cursor-pointer"
+                              title="حظر"
+                            >
+                              <Ban className="w-3 h-3" />
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                      <img
+                        src={slotPlayer.avatar || '/assets/images/avatar_kuwaiti_boy_1794404782928.jpg'}
+                        alt={slotPlayer.displayName}
+                        className="w-13 h-13 sm:w-14 sm:h-14 rounded-full object-cover border-2"
+                        style={{
+                          borderColor: seatColor,
+                          boxShadow: `0 0 14px ${seatColor}99`
+                        }}
+                      />
                     </div>
                   </div>
-                  <div className="relative">
-                    <Users className="w-8 h-8 text-cyan-400 animate-pulse" />
-                    <Wifi className="w-4 h-4 text-cyan-300 absolute -top-1 -right-1" />
-                  </div>
-                </div>
-              )}
+                );
+              })}
             </div>
           </div>
 
@@ -1809,11 +1892,17 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
 
               <div className="flex items-center gap-2 text-xs sm:text-sm font-black text-white">
                 <Lock className="w-4 h-4 text-cyan-400 shrink-0" />
-                <span>نوع الغرفة: خاصة برمز ({activeRoom.code})</span>
+                <span>
+                  {activeRoom.isPublic
+                    ? `غرفة عامة (${roomMaxPlayers} لاعبين) • #${activeRoom.code}`
+                    : `خاصة برمز (${activeRoom.code}) • ${roomMaxPlayers} لاعبين`}
+                </span>
               </div>
             </div>
             <div className="text-[11px] sm:text-xs text-sky-200/70 mt-2 text-right">
-              لا يوجد انضمام عشوائي — فقط من يملك رمز الغرفة أو إضافته يمكنه الانضمام.
+              {activeRoom.isPublic
+                ? `غرفة عامة تسع حتى ${roomMaxPlayers} لاعبين — يمكنك البدء عند وجود لاعبين أو انتظار اكتمال المقاعد.`
+                : `شارك الرمز مع أصدقائك (حتى ${roomMaxPlayers} لاعبين) — يمكنك بدء السباق بمجرد انضمام لاعب ثانٍ أو انتظار البقية.`}
             </div>
           </div>
 
@@ -1830,9 +1919,9 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
                 {/* Button 1: Host Waiting / Start Button */}
                 <button
                   onClick={handleStartGame}
-                  disabled={!isRoomFull || isSubmitting}
+                  disabled={!canStartGame || isSubmitting}
                   className={`w-full py-3.5 sm:py-4 rounded-full font-black text-sm sm:text-base flex items-center justify-center gap-2.5 transition-all ${
-                    isRoomFull && !isSubmitting
+                    canStartGame && !isSubmitting
                       ? 'bg-gradient-to-r from-lime-400 via-emerald-400 to-lime-500 text-slate-950 shadow-xl shadow-lime-500/30 active:scale-98 cursor-pointer'
                       : 'bg-slate-800/80 border border-slate-700/60 text-slate-400 cursor-not-allowed'
                   }`}
@@ -1842,12 +1931,14 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
                     {isSubmitting
                       ? 'جارِ إطلاق المباراة...'
                       : isRoomFull
-                      ? 'انطلاق سباق الكلمات بين اللاعبين! 🔥'
-                      : 'بانتظار انضمام اللاعب الثاني...'}
+                      ? `انطلاق سباق الكلمات (${orderedPlayers.length} لاعبين)! 🔥`
+                      : canStartGame
+                      ? `انطلاق السباق الآن (${orderedPlayers.length} من ${roomMaxPlayers} لاعبين) 🔥`
+                      : 'بانتظار انضمام لاعب ثانٍ على الأقل...'}
                   </span>
                 </button>
 
-                {/* Button 2: Bright Neon Cyan/Green Instant 1v1 Race Button */}
+                {/* Button 2: Bright Neon Cyan/Green Instant Race with Bot */}
                 {!isRoomFull && (
                   <button
                     onClick={handleAddLiveRival}
@@ -1855,16 +1946,22 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
                     className="w-full py-3.5 sm:py-4 rounded-full bg-gradient-to-r from-[#00f2fe] via-[#4facfe] to-[#00f2fe] hover:brightness-110 text-slate-950 font-black text-sm sm:text-base flex items-center justify-center gap-2 shadow-[0_0_25px_rgba(79,172,254,0.65)] active:scale-98 transition-all cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     <Shuffle className="w-5 h-5 text-slate-950" />
-                    <span>خلط تنافسي مباشر الآن (بدء فوري 1 ضد 1)</span>
+                    <span>
+                      {orderedPlayers.length < 2
+                        ? 'خلط تنافسي مباشر الآن (بدء فوري 1 ضد 1)'
+                        : 'إضافة منافس آلي والانطلاق فوراً ⚡'}
+                    </span>
                     <Zap className="w-4 h-4 text-amber-600 fill-amber-500" />
                   </button>
                 )}
               </>
             ) : (
-              /* Guest View (Player 2) */
+              /* Guest View (Player 2..4) */
               <div className="w-full py-4 px-6 rounded-full bg-[#082338] border-2 border-cyan-400/50 text-cyan-200 font-black text-sm sm:text-base flex items-center justify-center gap-2.5 shadow-[0_0_16px_rgba(56,189,248,0.3)]">
                 <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 shadow-[0_0_8px_#34d399] animate-pulse" />
-                <span>تم الانضمام للغرفة بنجاح! بانتظار أن يبدأ المضيف اللعبة... ⚡</span>
+                <span>
+                  تم الانضمام للغرفة بنجاح ({orderedPlayers.length}/{roomMaxPlayers})! بانتظار أن يبدأ المضيف اللعبة... ⚡
+                </span>
               </div>
             )}
           </div>
@@ -2104,7 +2201,7 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
 
           {/* Subtitle */}
           <p className="text-sm sm:text-base font-bold text-slate-200 text-center max-w-md mb-4 leading-relaxed">
-            أنشئ غرفة خاصة وادعُ صديقك للانضمام واللعب معاً
+            أنشئ غرفة خاصة أو عامة وادعُ حتى 4 لاعبين للعب أونلاين معاً
           </p>
 
           {/* Main Glowing Cyan Form Card */}
@@ -2398,6 +2495,56 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
                   <Lock className="w-5 h-5 text-emerald-300" />
                   <span>خاصة</span>
                 </button>
+              </div>
+            </div>
+
+            {/* FIELD 4.5: الحد الأقصى للاعبين (2 | 3 | 4 لاعبين) */}
+            <div>
+              <label className="flex items-center justify-between gap-2 text-base sm:text-lg font-black text-white mb-2.5">
+                <span className="flex items-center gap-2">
+                  <Users className="w-5 h-5 text-cyan-400" />
+                  <span>عدد اللاعبين الأونلاين</span>
+                </span>
+                <span className="px-2.5 py-0.5 rounded-full bg-cyan-500/15 border border-cyan-400/40 text-cyan-200 text-[11px] font-black">
+                  من 2 إلى 4 لاعبين
+                </span>
+              </label>
+
+              <div className="grid grid-cols-3 gap-2.5 sm:gap-3.5">
+                {([
+                  { count: 2 as const, label: 'لاعبان (1×1)', badge: 'ثنائي' },
+                  { count: 3 as const, label: '3 لاعبين', badge: 'ثلاثي' },
+                  { count: 4 as const, label: '4 لاعبين', badge: 'رباعي 🔥' }
+                ]).map((opt) => {
+                  const active = maxPlayers === opt.count;
+                  return (
+                    <button
+                      key={opt.count}
+                      type="button"
+                      onClick={() => {
+                        sounds.playTap();
+                        setMaxPlayers(opt.count);
+                      }}
+                      className="rounded-2xl px-2.5 py-2.5 flex flex-col items-center justify-center gap-0.5 text-white transition-all cursor-pointer active:scale-95"
+                      style={
+                        active
+                          ? {
+                              background:
+                                'linear-gradient(180deg, rgba(16, 185, 129, 0.32) 0%, rgba(5, 102, 72, 0.5) 100%)',
+                              border: '2px solid #10b981',
+                              boxShadow: '0 0 20px rgba(16, 185, 129, 0.5)'
+                            }
+                          : {
+                              background: 'linear-gradient(180deg, #0c2b40 0%, #071c2b 100%)',
+                              border: '1.5px solid rgba(125, 211, 252, 0.35)'
+                            }
+                      }
+                    >
+                      <span className="font-black text-sm sm:text-base">{opt.label}</span>
+                      <span className="text-[10px] font-bold text-slate-300">{opt.badge}</span>
+                    </button>
+                  );
+                })}
               </div>
             </div>
 
@@ -2716,7 +2863,9 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
                     >
                       <span className="text-lime-400 font-black">#{r.code}</span>
                       <span className="text-slate-300 text-[11px]">({r.roomName})</span>
-                      <span className="text-[10px] text-amber-300 bg-amber-400/15 px-1 rounded">1/2</span>
+                      <span className="text-[10px] text-amber-300 bg-amber-400/15 px-1 rounded">
+                        {r.playerCount}/{r.maxPlayers || 2}
+                      </span>
                     </button>
                   ))}
                 </div>
@@ -2873,7 +3022,7 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
                           {r.roomName || `غرفة ${r.hostName}`}
                         </div>
                         <div className="text-[11px] text-cyan-300">
-                          الرمز: <span className="font-mono font-black">{r.code}</span> • {getCategoryName(r.categoryId)}
+                          الرمز: <span className="font-mono font-black">{r.code}</span> • {getCategoryName(r.categoryId)} • {r.playerCount}/{r.maxPlayers || 2} لاعبين
                         </div>
                       </div>
                       <div className="flex items-center gap-1.5">
@@ -2968,6 +3117,8 @@ export const OnlineLobbyScreen: React.FC<OnlineLobbyScreenProps> = ({
                   categoryId: selectedCategory,
                   levelNumber: 1,
                   stagesCount,
+                  difficulty,
+                  maxPlayers,
                   isPublic: false,
                   gameMode: selectedGameMode
                 }

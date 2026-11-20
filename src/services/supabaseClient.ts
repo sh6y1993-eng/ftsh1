@@ -356,6 +356,167 @@ export function ensureFullProfileDefaults(profile: PlayerProfile): PlayerProfile
   };
 }
 
+type CompletedLevelEntry = NonNullable<PlayerProfile['completedLevels']>[string];
+
+export function mergeCompletedLevelsMap(
+  a?: PlayerProfile['completedLevels'] | null,
+  b?: PlayerProfile['completedLevels'] | null
+): NonNullable<PlayerProfile['completedLevels']> {
+  const merged: NonNullable<PlayerProfile['completedLevels']> = {};
+  const addSource = (src?: PlayerProfile['completedLevels'] | null) => {
+    if (!src || typeof src !== 'object') return;
+    Object.entries(src).forEach(([key, rec]) => {
+      if (!rec || typeof rec !== 'object') return;
+      const existing = merged[key];
+      const nextStars = Math.max(0, Number(rec.stars) || 0);
+      const nextTime = Number(rec.bestTime) > 0 ? Number(rec.bestTime) : 9999;
+      const nextScore = Math.max(0, Number(rec.score) || 0);
+      const nextAccuracy = Math.max(0, Number(rec.accuracy) || 0);
+      if (!existing) {
+        merged[key] = {
+          stars: nextStars,
+          bestTime: nextTime,
+          score: nextScore,
+          ...(nextAccuracy > 0 ? { accuracy: nextAccuracy } : {}),
+          ...(rec.completedAt ? { completedAt: rec.completedAt } : {})
+        };
+      } else {
+        const bestAccuracy = Math.max(Number(existing.accuracy) || 0, nextAccuracy);
+        merged[key] = {
+          stars: Math.max(Number(existing.stars) || 0, nextStars),
+          bestTime: Math.min(
+            Number(existing.bestTime) > 0 ? Number(existing.bestTime) : 9999,
+            nextTime
+          ),
+          score: Math.max(Number(existing.score) || 0, nextScore),
+          ...(bestAccuracy > 0 ? { accuracy: bestAccuracy } : {}),
+          completedAt: existing.completedAt || rec.completedAt
+        };
+      }
+    });
+  };
+  addSource(a);
+  addSource(b);
+  return merged;
+}
+
+export function mergePlayerProfiles(
+  primary: PlayerProfile,
+  secondary?: PlayerProfile | null
+): PlayerProfile {
+  if (!secondary) {
+    return ensureFullProfileDefaults(primary);
+  }
+  const primaryKey = normalizeUsernameKey(primary.username || '');
+  const secondaryKey = normalizeUsernameKey(secondary.username || '');
+  if (primaryKey && secondaryKey && primaryKey !== secondaryKey) {
+    return ensureFullProfileDefaults(primary);
+  }
+
+  const mergedCompleted = mergeCompletedLevelsMap(primary.completedLevels, secondary.completedLevels);
+  const completedCount = Object.keys(mergedCompleted).length;
+  const completedScoreSum = Object.values(mergedCompleted).reduce(
+    (sum, lvl) => sum + (Number(lvl?.score) || 0),
+    0
+  );
+
+  const primaryHasProgress =
+    (Number(primary.xp) || 0) > 0 || Object.keys(primary.completedLevels || {}).length > 0;
+  const secondaryHasProgress =
+    (Number(secondary.xp) || 0) > 0 || Object.keys(secondary.completedLevels || {}).length > 0;
+
+  const resolvedCoins =
+    !primaryHasProgress && secondaryHasProgress && typeof secondary.coins === 'number'
+      ? secondary.coins
+      : typeof primary.coins === 'number'
+        ? primary.coins
+        : secondary.coins;
+
+  const mergedXp = Math.max(Number(primary.xp) || 0, Number(secondary.xp) || 0);
+  const mergedLevel = Math.max(
+    Number(primary.level) || 1,
+    Number(secondary.level) || 1,
+    Math.floor(mergedXp / 300) + 1
+  );
+
+  const unionStrings = (arrA?: string[], arrB?: string[]): string[] | undefined => {
+    if (!Array.isArray(arrA) && !Array.isArray(arrB)) return undefined;
+    return Array.from(new Set([...(arrA || []), ...(arrB || [])]));
+  };
+
+  const mergedProfile: PlayerProfile = {
+    ...secondary,
+    ...primary,
+    id: primary.id || secondary.id,
+    username: primary.username || secondary.username,
+    displayName: primary.displayName || secondary.displayName,
+    avatar: primary.avatar || secondary.avatar,
+    email: primary.email || secondary.email,
+    authToken: primary.authToken || secondary.authToken,
+    xp: mergedXp,
+    level: mergedLevel,
+    seasonXp: Math.max(Number(primary.seasonXp) || 0, Number(secondary.seasonXp) || 0, mergedXp),
+    coins: typeof resolvedCoins === 'number' ? resolvedCoins : DEFAULT_FREE_ACCOUNT_COINS,
+    hintsRemaining:
+      !primaryHasProgress && secondaryHasProgress
+        ? Math.max(Number(primary.hintsRemaining) || 0, Number(secondary.hintsRemaining) || 0)
+        : typeof primary.hintsRemaining === 'number'
+          ? primary.hintsRemaining
+          : secondary.hintsRemaining,
+    completedLevels: mergedCompleted,
+    completedLevelsCount: Math.max(
+      Number(primary.completedLevelsCount) || 0,
+      Number(secondary.completedLevelsCount) || 0,
+      completedCount
+    ),
+    totalScore: Math.max(
+      Number(primary.totalScore) || 0,
+      Number(secondary.totalScore) || 0,
+      completedScoreSum
+    ),
+    totalWordsFound: Math.max(
+      Number(primary.totalWordsFound) || 0,
+      Number(secondary.totalWordsFound) || 0,
+      completedCount * 6
+    ),
+    perfectStagesCount: Math.max(
+      Number(primary.perfectStagesCount) || 0,
+      Number(secondary.perfectStagesCount) || 0
+    ),
+    fastStagesCount: Math.max(
+      Number(primary.fastStagesCount) || 0,
+      Number(secondary.fastStagesCount) || 0
+    ),
+    multiplayerWins: Math.max(
+      Number(primary.multiplayerWins) || 0,
+      Number(secondary.multiplayerWins) || 0
+    ),
+    multiplayerLosses: Math.max(
+      Number(primary.multiplayerLosses) || 0,
+      Number(secondary.multiplayerLosses) || 0
+    ),
+    achievements: unionStrings(primary.achievements, secondary.achievements) || [],
+    unlockedTitles: unionStrings(primary.unlockedTitles, secondary.unlockedTitles),
+    unlockedCosmetics: unionStrings(primary.unlockedCosmetics, secondary.unlockedCosmetics),
+    unlockedBoardThemes: unionStrings(primary.unlockedBoardThemes, secondary.unlockedBoardThemes),
+    unlockedTrails: unionStrings(primary.unlockedTrails, secondary.unlockedTrails),
+    unlockedNameGlows: unionStrings(primary.unlockedNameGlows, secondary.unlockedNameGlows),
+    unlockedEmotePacks: unionStrings(primary.unlockedEmotePacks, secondary.unlockedEmotePacks),
+    unlockedCategories: unionStrings(primary.unlockedCategories, secondary.unlockedCategories),
+    unlockedAvatars: unionStrings(primary.unlockedAvatars, secondary.unlockedAvatars),
+    unlockedOnlineModes: unionStrings(primary.unlockedOnlineModes, secondary.unlockedOnlineModes),
+    friends: unionStrings(primary.friends, secondary.friends),
+    claimedSeasonTiers: Array.from(
+      new Set([...(primary.claimedSeasonTiers || []), ...(secondary.claimedSeasonTiers || [])])
+    ),
+    isVip: Boolean(primary.isVip || secondary.isVip),
+    starterPackPurchased: Boolean(primary.starterPackPurchased || secondary.starterPackPurchased),
+    granted20kFreeCoins: Boolean(primary.granted20kFreeCoins || secondary.granted20kFreeCoins)
+  };
+
+  return evaluateAndGrantAchievements(ensureFullProfileDefaults(mergedProfile)).updatedProfile;
+}
+
 export function loadLocalUsersMap(): Record<string, PlayerProfile> {
   try {
     const raw = localStorage.getItem(LOCAL_USERS_DB_KEY);
@@ -377,11 +538,24 @@ export function loadLocalUsersMap(): Record<string, PlayerProfile> {
 export function saveUserToLocalMap(profile: PlayerProfile): PlayerProfile {
   const cleanKey = normalizeUsernameKey(profile.username);
   const existingToken = profile.authToken || getStoredAuthToken(cleanKey) || undefined;
+  let candidateProfile: PlayerProfile = {
+    ...profile,
+    ...(existingToken ? { authToken: existingToken } : {})
+  };
+
+  // Never allow a stale React closure or blank cloud/OAuth shell to wipe previously earned completed stages
+  try {
+    const currentMap = loadLocalUsersMap();
+    const prevLocal = currentMap[cleanKey];
+    if (prevLocal && !cleanKey.startsWith('guest_')) {
+      candidateProfile = mergePlayerProfiles(candidateProfile, prevLocal);
+    }
+  } catch {
+    // ignore storage read errors
+  }
+
   const enriched = evaluateAndGrantAchievements(
-    ensureFullProfileDefaults({
-      ...profile,
-      ...(existingToken ? { authToken: existingToken } : {})
-    })
+    ensureFullProfileDefaults(candidateProfile)
   ).updatedProfile;
   try {
     if (enriched.authToken) {
@@ -486,17 +660,143 @@ export async function syncAccountWithServer(
   return result.profile;
 }
 
-// Sync profile via authoritative Express backend (Express handles server-side Supabase sync with service role).
-// Direct client-side unauthenticated REST queries/upserts to public.profiles are strictly disabled.
+async function getSupabaseRestHeaders(extraHeaders?: Record<string, string>): Promise<Record<string, string>> {
+  let bearer = SUPABASE_ANON_KEY;
+  if (supabase) {
+    try {
+      const { data } = await Promise.race([
+        supabase.auth.getSession(),
+        new Promise<{ data: null }>(resolve => setTimeout(() => resolve({ data: null }), 1200))
+      ]);
+      if (data?.session?.access_token) {
+        bearer = data.session.access_token;
+      }
+    } catch {
+      // Fallback to anon key
+    }
+  }
+  return {
+    apikey: SUPABASE_ANON_KEY,
+    Authorization: `Bearer ${bearer}`,
+    ...(extraHeaders || {})
+  };
+}
+
+function hydrateProfileFromSupabaseRow(row: any, fallbackUsername?: string): PlayerProfile {
+  const rowUserKey = normalizeUsernameKey(row?.username || fallbackUsername || 'player');
+  const completedLevels =
+    row?.completed_levels && typeof row.completed_levels === 'object' ? row.completed_levels : {};
+  const completedCount = Object.keys(completedLevels).length;
+  const scoreSum = Object.values(completedLevels).reduce(
+    (sum: number, lvl: any) => sum + (Number(lvl?.score) || 0),
+    0
+  );
+
+  return ensureFullProfileDefaults({
+    id: row?.id || `usr_${rowUserKey}`,
+    username: rowUserKey,
+    displayName: row?.display_name || rowUserKey,
+    ...(row?.email ? { email: String(row.email).toLowerCase() } : {}),
+    avatar: row?.avatar || '/assets/images/avatar_kuwaiti_boy_1794404782928.jpg',
+    level: Math.max(Number(row?.level) || 1, Math.floor((Number(row?.xp) || 0) / 300) + 1),
+    xp: Number(row?.xp) || 0,
+    coins: typeof row?.coins === 'number' ? row.coins : DEFAULT_FREE_ACCOUNT_COINS,
+    hintsRemaining: typeof row?.hints_remaining === 'number' ? row.hints_remaining : 5,
+    completedLevelsCount: completedCount,
+    completedLevels,
+    dailyChallenges: createDefaultDailyChallenges(),
+    dailyStreak: createDefaultDailyStreak(),
+    friends: [],
+    totalScore: scoreSum,
+    totalWordsFound: completedCount * 6,
+    perfectStagesCount: Object.values(completedLevels).filter((l: any) => (l?.accuracy ?? 100) >= 100).length,
+    fastStagesCount: Object.values(completedLevels).filter((l: any) => (l?.bestTime ?? 99) < 45).length,
+    selectedTitle: 'مستكشف الحروف',
+    unlockedTitles: ['مستكشف الحروف'],
+    selectedCosmetic: 'frame_default_cyan',
+    unlockedCosmetics: ['frame_default_cyan'],
+    multiplayerWins: Number(row?.multiplayer_wins) || 0,
+    multiplayerLosses: Number(row?.multiplayer_losses) || 0,
+    achievements: Array.isArray(row?.achievements) ? row.achievements : [],
+    createdAt: row?.created_at || new Date().toISOString()
+  });
+}
+
+export async function fetchCloudProfileFromSupabase(
+  usernameOrEmail: string,
+  secondaryEmail?: string
+): Promise<PlayerProfile | null> {
+  if (!isSupabaseConfigured) return null;
+  const raw = (usernameOrEmail || '').trim();
+  if (!raw) return null;
+  const cleanUser = normalizeUsernameKey(raw);
+  if (cleanUser.startsWith('guest_')) return null;
+
+  const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  const timer = controller ? setTimeout(() => controller.abort(), 3500) : null;
+  try {
+    const headers = await getSupabaseRestHeaders();
+    const filterParam = raw.includes('@')
+      ? `email=eq.${encodeURIComponent(raw.toLowerCase())}`
+      : `username=eq.${encodeURIComponent(cleanUser)}`;
+    const res = await globalThis.fetch(
+      `${SUPABASE_URL}/rest/v1/profiles?${filterParam}&select=*&limit=1`,
+      {
+        method: 'GET',
+        headers,
+        ...(controller ? { signal: controller.signal } : {})
+      }
+    );
+    if (res.ok) {
+      const rows = (await res.json().catch(() => [])) as any[];
+      if (Array.isArray(rows) && rows.length > 0) {
+        return hydrateProfileFromSupabaseRow(rows[0], cleanUser);
+      }
+    }
+
+    if (secondaryEmail && secondaryEmail.includes('@')) {
+      const emailRes = await globalThis.fetch(
+        `${SUPABASE_URL}/rest/v1/profiles?email=eq.${encodeURIComponent(secondaryEmail.trim().toLowerCase())}&select=*&limit=1`,
+        {
+          method: 'GET',
+          headers,
+          ...(controller ? { signal: controller.signal } : {})
+        }
+      );
+      if (emailRes.ok) {
+        const rows = (await emailRes.json().catch(() => [])) as any[];
+        if (Array.isArray(rows) && rows.length > 0) {
+          return hydrateProfileFromSupabaseRow(rows[0], cleanUser);
+        }
+      }
+    }
+  } catch {
+    // Non-blocking lookup
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  return null;
+}
+
+// Sync profile via authoritative Express backend (or merge-before-write Supabase fallback on static hosts)
 export async function syncProfileWithSupabase(
   profile: PlayerProfile,
   email?: string,
   passwordHash?: string
 ): Promise<PlayerProfile> {
-  const { profile: normalizedProfile, serverSynced } = await syncAccountWithServerDetailed(profile, passwordHash);
+  const { profile: serverProfile, serverSynced } = await syncAccountWithServerDetailed(profile, passwordHash);
+  let normalizedProfile = mergePlayerProfiles(serverProfile, profile);
+
   if (!serverSynced && isSupabaseConfigured && !normalizedProfile.username.startsWith('guest_')) {
     try {
       const cleanUser = normalizeUsernameKey(normalizedProfile.username);
+      // CRITICAL: Always fetch existing cloud progress BEFORE writing so a fresh browser/OAuth session NEVER wipes completed stages
+      const cloudExisting = await fetchCloudProfileFromSupabase(cleanUser, email);
+      if (cloudExisting) {
+        normalizedProfile = mergePlayerProfiles(normalizedProfile, cloudExisting);
+        normalizedProfile = saveUserToLocalMap(normalizedProfile);
+      }
+
       const payload: Record<string, unknown> = {
         id: normalizedProfile.id || `usr_${cleanUser}`,
         username: cleanUser,
@@ -519,14 +819,13 @@ export async function syncProfileWithSupabase(
       if (resolvedPwHash) {
         payload.password_hash = resolvedPwHash;
       }
+      const headers = await getSupabaseRestHeaders({
+        'Content-Type': 'application/json',
+        Prefer: 'resolution=merge-duplicates,return=minimal'
+      });
       await globalThis.fetch(`${SUPABASE_URL}/rest/v1/profiles?on_conflict=username`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          apikey: SUPABASE_ANON_KEY,
-          Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-          Prefer: 'resolution=merge-duplicates,return=minimal'
-        },
+        headers,
         body: JSON.stringify(payload)
       });
     } catch {
@@ -1102,23 +1401,21 @@ export async function loginWithUsernameAndPassword(
   const storedPasswordHash: string | undefined = localPasswords[resolvedLocalKey];
   const storedEmail: string | undefined = localEmails[resolvedLocalKey];
 
-  // 2b. Cloud profile lookup on Supabase when logging in from a new device (e.g. Smart TV / Vercel static deployment)
-  if (!localProfile && !expressReachable && isSupabaseConfigured) {
+  // 2b. Cloud profile lookup on Supabase when Express is unreachable (restores & merges completed stages across devices)
+  if (!expressReachable && isSupabaseConfigured) {
     try {
       const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
       const timer = controller ? setTimeout(() => controller.abort(), 5000) : null;
       try {
+        const headers = await getSupabaseRestHeaders();
         const filterParam = looksLikeEmail
           ? `email=eq.${encodeURIComponent(rawTrimmed)}`
-          : `username=eq.${encodeURIComponent(cleanUsername)}`;
+          : `username=eq.${encodeURIComponent(resolvedLocalKey || cleanUsername)}`;
         let sbRes = await globalThis.fetch(
           `${SUPABASE_URL}/rest/v1/profiles?${filterParam}&select=*&limit=1`,
           {
             method: 'GET',
-            headers: {
-              apikey: SUPABASE_ANON_KEY,
-              Authorization: `Bearer ${SUPABASE_ANON_KEY}`
-            },
+            headers,
             ...(controller ? { signal: controller.signal } : {})
           }
         );
@@ -1130,10 +1427,7 @@ export async function loginWithUsernameAndPassword(
             `${SUPABASE_URL}/rest/v1/profiles?display_name=ilike.${encodeURIComponent(rawUsername.trim())}&select=*&limit=1`,
             {
               method: 'GET',
-              headers: {
-                apikey: SUPABASE_ANON_KEY,
-                Authorization: `Bearer ${SUPABASE_ANON_KEY}`
-              },
+              headers,
               ...(controller ? { signal: controller.signal } : {})
             }
           );
@@ -1144,59 +1438,41 @@ export async function loginWithUsernameAndPassword(
         }
 
         if (sbRes.ok && Array.isArray(rows)) {
-          if (rows.length === 0) {
+          if (rows.length === 0 && !localProfile) {
             return { status: 'UNREGISTERED' };
           }
-          const row = rows[0];
-          const rowUserKey = normalizeUsernameKey(row.username || cleanUsername);
-          const expectedHash = hashPassword(rowUserKey, rawPassword);
-          const remoteHash = typeof row.password_hash === 'string' ? row.password_hash.trim() : '';
+          if (rows.length > 0) {
+            const row = rows[0];
+            const rowUserKey = normalizeUsernameKey(row.username || cleanUsername);
+            const expectedHash = hashPassword(rowUserKey, rawPassword);
+            const remoteHash = typeof row.password_hash === 'string' ? row.password_hash.trim() : '';
 
-          if (remoteHash && remoteHash.startsWith('fts_pw_') && remoteHash !== expectedHash && remoteHash !== pwHash) {
+            if (remoteHash && remoteHash.startsWith('fts_pw_') && remoteHash !== expectedHash && remoteHash !== pwHash) {
+              return {
+                status: 'WRONG_PASSWORD',
+                message: 'كلمة المرور غير صحيحة لهذا الحساب! يرجى التأكد من كلمة المرور.'
+              };
+            }
+
+            const hydratedCloud = hydrateProfileFromSupabaseRow(row, rowUserKey);
+            const mergedProfile = localProfile
+              ? mergePlayerProfiles(hydratedCloud, localProfile)
+              : hydratedCloud;
+
+            saveLocalPasswordHash(rowUserKey, expectedHash);
+            if (row.email && typeof row.email === 'string') {
+              saveLocalUserEmail(rowUserKey, row.email);
+            }
+            const savedMerged = saveUserToLocalMap(mergedProfile);
+            // If local device had newer stages than cloud, push the merged progress back up
+            if (Object.keys(savedMerged.completedLevels || {}).length > Object.keys(hydratedCloud.completedLevels || {}).length) {
+              void syncProfileWithSupabase(savedMerged, row.email || storedEmail, expectedHash);
+            }
             return {
-              status: 'WRONG_PASSWORD',
-              message: 'كلمة المرور غير صحيحة لهذا الحساب! يرجى التأكد من كلمة المرور.'
+              status: 'SUCCESS',
+              profile: savedMerged
             };
           }
-
-          const completedLevels =
-            row.completed_levels && typeof row.completed_levels === 'object' ? row.completed_levels : {};
-          const hydratedProfile: PlayerProfile = ensureFullProfileDefaults({
-            id: row.id || `usr_${rowUserKey}`,
-            username: rowUserKey,
-            displayName: row.display_name || rowUserKey,
-            avatar: row.avatar || '/assets/images/avatar_kuwaiti_boy_1794404782928.jpg',
-            level: Number(row.level) || 1,
-            xp: Number(row.xp) || 0,
-            coins: typeof row.coins === 'number' ? row.coins : DEFAULT_FREE_ACCOUNT_COINS,
-            hintsRemaining: typeof row.hints_remaining === 'number' ? row.hints_remaining : 5,
-            completedLevelsCount: Object.keys(completedLevels).length,
-            completedLevels,
-            dailyChallenges: createDefaultDailyChallenges(),
-            dailyStreak: createDefaultDailyStreak(),
-            friends: [],
-            totalScore: 0,
-            totalWordsFound: 0,
-            perfectStagesCount: 0,
-            fastStagesCount: 0,
-            selectedTitle: 'مستكشف الحروف',
-            unlockedTitles: ['مستكشف الحروف'],
-            selectedCosmetic: 'frame_default_cyan',
-            unlockedCosmetics: ['frame_default_cyan'],
-            multiplayerWins: Number(row.multiplayer_wins) || 0,
-            multiplayerLosses: Number(row.multiplayer_losses) || 0,
-            achievements: Array.isArray(row.achievements) ? row.achievements : [],
-            createdAt: row.created_at || new Date().toISOString()
-          });
-
-          saveLocalPasswordHash(rowUserKey, expectedHash);
-          if (row.email && typeof row.email === 'string') {
-            saveLocalUserEmail(rowUserKey, row.email);
-          }
-          return {
-            status: 'SUCCESS',
-            profile: saveUserToLocalMap(hydratedProfile)
-          };
         }
       } finally {
         if (timer) clearTimeout(timer);

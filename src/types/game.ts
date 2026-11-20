@@ -428,8 +428,20 @@ export interface PublicRoomSummary {
   gameMode?: OnlineGameModeId;
   difficulty?: OnlineDifficulty;
   stagesCount?: number;
+  maxPlayers?: number;
   playerCount: number;
   createdAt: number;
+}
+
+export interface ClaimedWordRecord {
+  word: string;
+  displayWord?: string;
+  playerId: string;
+  playerName: string;
+  playerColor: string;
+  claimedAt: number;
+  wordScore: number;
+  cells?: { row: number; col: number }[];
 }
 
 export interface OnlineRoom {
@@ -437,6 +449,7 @@ export interface OnlineRoom {
   roomName?: string;
   hostId: string;
   isPublic?: boolean;
+  maxPlayers?: number;
   gameMode?: OnlineGameModeId;
   difficulty?: OnlineDifficulty;
   speedTurnSeconds?: number;
@@ -457,6 +470,7 @@ export interface OnlineRoom {
   words: string[];
   grid: string[][];
   wordPlacements: WordPlacement[];
+  claimedWords?: Record<string, ClaimedWordRecord>;
   players: Record<string, OnlineRoomPlayer>;
   state: 'WAITING' | 'PLAYING' | 'FINISHED';
   startedAt?: number;
