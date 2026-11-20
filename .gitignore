@@ -1,0 +1,28 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+data/.auth-secret
+data/test-database.json
+
+
+# Local Secrets & Runtime Receipts
+data/.admin-secret
+data/.auth-secret
+data/.database_initialization_receipt.json
+.server_first_run_completed.json
+metadata.json
+
+# Live Database & Backups
+data/database.json
+data/test-database.json
+data/backups/
+backups/
+*.tar.gz
+
+# AI Studio Temp Artifacts
+.aistudio/
