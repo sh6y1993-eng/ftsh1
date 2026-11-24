@@ -1,0 +1,1072 @@
+import React, { useState, useEffect, useCallback } from 'react';
+import {
+  FriendProfileSummary,
+  PlayerProfile,
+  RoomInviteNotification
+} from '../types/game';
+import {
+  X,
+  UserPlus,
+  Users,
+  Search,
+  Copy,
+  Check,
+  Send,
+  Trash2,
+  Play,
+  Lock,
+  RefreshCw,
+  Sparkles,
+  Wifi,
+  Flag,
+  Ban,
+  ShieldOff
+} from 'lucide-react';
+import { sounds } from '../utils/audio';
+import { apiFetch as fetch } from '../services/supabaseClient';
+import { realtimeSync } from '../services/realtimeSync';
+import { ReportPlayerModal } from './ReportPlayerModal';
+
+interface FriendsModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+  currentUser: PlayerProfile | null;
+  activeRoomCode?: string;
+  activeRoomName?: string;
+  activeCategoryId?: string;
+  activeStagesCount?: number;
+  onJoinRoomCode?: (roomCode: string) => void;
+  onCreatePrivateRoomAndInvite?: (friend: FriendProfileSummary) => void;
+  onUpdateUser?: (user: PlayerProfile) => void;
+}
+
+export const FriendsModal: React.FC<FriendsModalProps> = ({
+  isOpen,
+  onClose,
+  currentUser,
+  activeRoomCode,
+  activeRoomName,
+  activeCategoryId = 'kuwait_heritage',
+  activeStagesCount = 50,
+  onJoinRoomCode,
+  onCreatePrivateRoomAndInvite,
+  onUpdateUser
+}) => {
+  const [friends, setFriends] = useState<FriendProfileSummary[]>([]);
+  const [suggestions, setSuggestions] = useState<FriendProfileSummary[]>([]);
+  const [pendingInvites, setPendingInvites] = useState<RoomInviteNotification[]>([]);
+  const [usernameInput, setUsernameInput] = useState('');
+  const [searchResults, setSearchResults] = useState<(FriendProfileSummary & { isFriend?: boolean })[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [statusMsg, setStatusMsg] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
+  const [copiedMyUsername, setCopiedMyUsername] = useState(false);
+  const [invitedUsernames, setInvitedUsernames] = useState<Record<string, boolean>>({});
+  const [blockedUsers, setBlockedUsers] = useState<
+    { username: string; displayName: string; avatar: string }[]
+  >([]);
+  const [showBlockedList, setShowBlockedList] = useState(false);
+  const [reportTarget, setReportTarget] = useState<{ username: string; displayName: string } | null>(null);
+
+  const myUsername = currentUser?.username || 'ahmad_kwt';
+  const myDisplayName = currentUser?.displayName || 'أحمد الكندري';
+
+  const isJsonResponse = (res: Response | null): res is Response =>
+    Boolean(res && res.ok && (res.headers.get('content-type') || '').includes('application/json'));
+
+  const fetchFriendsData = useCallback(async () => {
+    try {
+      setLoading(true);
+      const localFriends = currentUser?.friends || [];
+      const [friendsRes, blockedRes, cloudData] = await Promise.all([
+        fetch(`/api/friends?username=${encodeURIComponent(myUsername)}`).catch(() => null),
+        currentUser?.username
+          ? fetch(`/api/moderation/blocked?username=${encodeURIComponent(currentUser.username)}`).catch(
+              () => null
+            )
+          : Promise.resolve(null),
+        realtimeSync.fetchCloudFriendsAndSuggestions(myUsername, localFriends).catch(() => null)
+      ]);
+
+      let serverFriends: FriendProfileSummary[] = [];
+      let serverSuggestions: FriendProfileSummary[] = [];
+      let serverInvites: RoomInviteNotification[] = [];
+
+      if (isJsonResponse(friendsRes)) {
+        const data = await friendsRes.json().catch(() => null);
+        if (data?.success) {
+          serverFriends = Array.isArray(data.friends) ? data.friends : [];
+          serverSuggestions = Array.isArray(data.suggestions) ? data.suggestions : [];
+          serverInvites = Array.isArray(data.pendingInvites) ? data.pendingInvites : [];
+        }
+      }
+
+      // Merge server + cloud friends by username, prioritizing live room status
+      const mergedFriendsMap = new Map<string, FriendProfileSummary>();
+      for (const f of [...(cloudData?.friends || []), ...serverFriends]) {
+        if (!f?.username) continue;
+        const key = f.username.toLowerCase();
+        const existing = mergedFriendsMap.get(key);
+        if (!existing) {
+          mergedFriendsMap.set(key, f);
+        } else {
+          // Prefer whichever entry has IN_ROOM / IN_GAME / ONLINE status
+          const preferNew =
+            existing.onlineStatus === 'OFFLINE' && f.onlineStatus !== 'OFFLINE';
+          mergedFriendsMap.set(key, preferNew ? f : { ...f, ...existing, activeRoomCode: existing.activeRoomCode || f.activeRoomCode });
+        }
+      }
+
+      const mergedSuggestionsMap = new Map<string, FriendProfileSummary>();
+      for (const s of [...serverSuggestions, ...(cloudData?.suggestions || [])]) {
+        if (!s?.username) continue;
+        const key = s.username.toLowerCase();
+        if (key === myUsername.toLowerCase() || mergedFriendsMap.has(key)) continue;
+        if (!mergedSuggestionsMap.has(key)) {
+          mergedSuggestionsMap.set(key, s);
+        }
+      }
+
+      const mergedInvitesMap = new Map<string, RoomInviteNotification>();
+      for (const inv of [...serverInvites, ...(cloudData?.pendingInvites || [])]) {
+        if (!inv?.roomCode) continue;
+        mergedInvitesMap.set(`${inv.fromUsername}_${inv.roomCode}`, inv);
+      }
+
+      setFriends(Array.from(mergedFriendsMap.values()));
+      setSuggestions(Array.from(mergedSuggestionsMap.values()).slice(0, 8));
+      setPendingInvites(Array.from(mergedInvitesMap.values()));
+
+      if (isJsonResponse(blockedRes)) {
+        const bData = await blockedRes.json().catch(() => null);
+        if (bData?.success && Array.isArray(bData.blockedDetails)) {
+          setBlockedUsers(bData.blockedDetails);
+        }
+      }
+    } catch {
+      // Ignore network error
+    } finally {
+      setLoading(false);
+    }
+  }, [myUsername, currentUser?.username, currentUser?.friends]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    fetchFriendsData();
+    const interval = setInterval(fetchFriendsData, 5000);
+    return () => clearInterval(interval);
+  }, [isOpen, fetchFriendsData]);
+
+  // Live search when typing a unique username
+  useEffect(() => {
+    const q = usernameInput.trim().replace(/^@+/, '');
+    if (!q) {
+      setSearchResults([]);
+      return;
+    }
+    const timer = setTimeout(async () => {
+      try {
+        const currentFriendUsernames = friends.map(f => f.username);
+        const [res, cloudResults] = await Promise.all([
+          fetch(
+            `/api/friends/search?q=${encodeURIComponent(q)}&username=${encodeURIComponent(myUsername)}`
+          ).catch(() => null),
+          realtimeSync.searchCloudPlayers(q, myUsername, currentFriendUsernames).catch(() => [])
+        ]);
+
+        const merged = new Map<string, FriendProfileSummary & { isFriend?: boolean }>();
+        if (isJsonResponse(res)) {
+          const data = await res.json().catch(() => null);
+          if (data?.success && Array.isArray(data.results)) {
+            for (const r of data.results) {
+              if (r?.username) merged.set(r.username.toLowerCase(), r);
+            }
+          }
+        }
+        for (const cr of cloudResults) {
+          if (cr?.username && !merged.has(cr.username.toLowerCase())) {
+            merged.set(cr.username.toLowerCase(), cr);
+          }
+        }
+        setSearchResults(Array.from(merged.values()).slice(0, 8));
+      } catch {
+        // Ignore
+      }
+    }, 180);
+
+    return () => clearTimeout(timer);
+  }, [usernameInput, myUsername, friends]);
+
+  if (!isOpen) return null;
+
+  const handleCopyMyUsername = () => {
+    sounds.playTap();
+    navigator.clipboard.writeText(myUsername);
+    setCopiedMyUsername(true);
+    setTimeout(() => setCopiedMyUsername(false), 2000);
+  };
+
+  const handleAddFriend = async (targetUsername?: string) => {
+    const rawTarget = (targetUsername ?? usernameInput).trim().replace(/^@+/, '').toLowerCase();
+    if (!rawTarget) {
+      sounds.playError();
+      setStatusMsg({ text: 'يرجى كتابة اسم المستخدم الفريد للصديق أولاً', type: 'error' });
+      return;
+    }
+
+    sounds.playTap();
+    setStatusMsg(null);
+
+    try {
+      const existingFriendUsernames = Array.from(
+        new Set([...(currentUser?.friends || []), ...friends.map(f => f.username)])
+      );
+
+      let serverData: any = null;
+      const res = await fetch('/api/friends/add', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: myUsername,
+          friendUsername: rawTarget
+        })
+      }).catch(() => null);
+
+      if (isJsonResponse(res)) {
+        serverData = await res.json().catch(() => null);
+      }
+
+      if (serverData?.success) {
+        // Also mirror to cloud social cache in background
+        void realtimeSync.addCloudFriend(myUsername, rawTarget, existingFriendUsernames);
+        sounds.playMultiplayerWordScore(2, 0);
+        setFriends(serverData.friends || []);
+        setSuggestions(serverData.suggestions || []);
+        setUsernameInput('');
+        setSearchResults([]);
+        if (serverData.user && onUpdateUser) {
+          onUpdateUser(serverData.user);
+        }
+        setStatusMsg({
+          text: `تمت إضافة «${serverData.addedFriend?.displayName || rawTarget}» (@${rawTarget}) إلى قائمة أصدقائك بنجاح! 🎉`,
+          type: 'success'
+        });
+        return;
+      }
+
+      // Fallback to Supabase Cloud + Active Room / Guest resolution
+      const cloudRes = await realtimeSync.addCloudFriend(
+        myUsername,
+        rawTarget,
+        existingFriendUsernames
+      );
+
+      if (cloudRes.ok && cloudRes.addedFriend) {
+        sounds.playMultiplayerWordScore(2, 0);
+        if (cloudRes.friends) setFriends(cloudRes.friends);
+        if (cloudRes.suggestions) setSuggestions(cloudRes.suggestions);
+        setUsernameInput('');
+        setSearchResults([]);
+        if (currentUser && onUpdateUser && cloudRes.friendUsernames) {
+          onUpdateUser({
+            ...currentUser,
+            friends: cloudRes.friendUsernames
+          });
+        }
+        setStatusMsg({
+          text: `تمت إضافة «${cloudRes.addedFriend.displayName || rawTarget}» (@${cloudRes.addedFriend.username}) إلى قائمة أصدقائك بنجاح! 🎉`,
+          type: 'success'
+        });
+      } else {
+        sounds.playError();
+        setStatusMsg({
+          text: serverData?.error || cloudRes.error || 'لم يتم العثور على لاعب بهذا الاسم الفريد',
+          type: 'error'
+        });
+      }
+    } catch {
+      sounds.playError();
+      setStatusMsg({ text: 'تعذر إضافة الصديق حالياً، يرجى المحاولة مرة أخرى', type: 'error' });
+    }
+  };
+
+  const handleRemoveFriend = async (friendUsername: string, friendDisplayName: string) => {
+    sounds.playTap();
+    try {
+      const existingFriendUsernames = Array.from(
+        new Set([...(currentUser?.friends || []), ...friends.map(f => f.username)])
+      );
+
+      const [res, cloudRemoved] = await Promise.all([
+        fetch('/api/friends/remove', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: myUsername,
+            friendUsername
+          })
+        }).catch(() => null),
+        realtimeSync.removeCloudFriend(myUsername, friendUsername, existingFriendUsernames).catch(() => null)
+      ]);
+
+      let handled = false;
+      if (isJsonResponse(res)) {
+        const data = await res.json().catch(() => null);
+        if (data?.success) {
+          handled = true;
+          setFriends(data.friends || []);
+          setSuggestions(data.suggestions || []);
+          if (data.user && onUpdateUser) {
+            onUpdateUser(data.user);
+          }
+        }
+      }
+
+      if (!handled && cloudRemoved) {
+        setFriends(cloudRemoved.friends);
+        setSuggestions(cloudRemoved.suggestions);
+        if (currentUser && onUpdateUser) {
+          onUpdateUser({
+            ...currentUser,
+            friends: cloudRemoved.friendUsernames
+          });
+        }
+      }
+
+      setStatusMsg({
+        text: `تمت إزالة «${friendDisplayName}» من قائمة الأصدقاء`,
+        type: 'success'
+      });
+    } catch {
+      // Ignore
+    }
+  };
+
+  const handleBlockPlayer = async (targetUsername: string, targetDisplayName: string) => {
+    if (!currentUser?.username) return;
+    sounds.playTap();
+    try {
+      const res = await fetch('/api/moderation/block', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: currentUser.username,
+          targetUsername
+        })
+      }).catch(() => null);
+      const data = isJsonResponse(res) ? await res.json().catch(() => null) : null;
+      if (data?.success) {
+        sounds.playVictory();
+        if (data.user && onUpdateUser) onUpdateUser(data.user);
+        setStatusMsg({
+          text: `🚫 تم حظر «${targetDisplayName}» ولن يظهر لك في الغرف أو قائمة الأصدقاء`,
+          type: 'success'
+        });
+        await fetchFriendsData();
+      } else if (currentUser && onUpdateUser) {
+        const nextBlocked = Array.from(new Set([...(currentUser.blockedUsers || []), targetUsername.toLowerCase()]));
+        onUpdateUser({ ...currentUser, blockedUsers: nextBlocked });
+        sounds.playVictory();
+        setStatusMsg({
+          text: `🚫 تم حظر «${targetDisplayName}» ولن يظهر لك في الغرف أو قائمة الأصدقاء`,
+          type: 'success'
+        });
+      }
+    } catch {
+      sounds.playError();
+    }
+  };
+
+  const handleUnblockPlayer = async (targetUsername: string, targetDisplayName: string) => {
+    if (!currentUser?.username) return;
+    sounds.playTap();
+    try {
+      const res = await fetch('/api/moderation/unblock', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          username: currentUser.username,
+          targetUsername
+        })
+      }).catch(() => null);
+      const data = isJsonResponse(res) ? await res.json().catch(() => null) : null;
+      if (data?.success) {
+        sounds.playVictory();
+        if (data.user && onUpdateUser) onUpdateUser(data.user);
+        setStatusMsg({
+          text: `✓ تم إلغاء حظر «${targetDisplayName}»`,
+          type: 'success'
+        });
+        await fetchFriendsData();
+      }
+    } catch {
+      sounds.playError();
+    }
+  };
+
+  const handleSendDirectInvite = async (friend: FriendProfileSummary) => {
+    sounds.playTap();
+
+    // If user is not currently inside a waiting room, offer one-click private room creation + invite
+    if (!activeRoomCode && onCreatePrivateRoomAndInvite) {
+      onCreatePrivateRoomAndInvite(friend);
+      onClose();
+      return;
+    }
+
+    const codeToInvite = activeRoomCode || 'KWT55';
+    const inviteObj: RoomInviteNotification = {
+      id: `inv_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      fromUsername: myUsername,
+      fromDisplayName: myDisplayName,
+      fromAvatar: currentUser?.avatar || 'https://api.dicebear.com/7.x/bottts/svg?seed=host',
+      toUsername: friend.username,
+      roomCode: codeToInvite,
+      roomName: activeRoomName || `غرفة ${myDisplayName}`,
+      categoryId: activeCategoryId,
+      stagesCount: activeStagesCount,
+      createdAt: Date.now()
+    };
+
+    try {
+      const [res, cloudSent] = await Promise.all([
+        fetch('/api/friends/invite', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            fromUsername: myUsername,
+            toUsername: friend.username,
+            roomCode: codeToInvite,
+            roomName: activeRoomName || `غرفة ${myDisplayName}`,
+            categoryId: activeCategoryId,
+            stagesCount: activeStagesCount
+          })
+        }).catch(() => null),
+        realtimeSync.sendCloudRoomInvite(inviteObj).catch(() => false)
+      ]);
+
+      let serverOk = false;
+      if (isJsonResponse(res)) {
+        const data = await res.json().catch(() => null);
+        serverOk = Boolean(data?.success);
+      }
+
+      if (serverOk || cloudSent) {
+        sounds.playMultiplayerWordScore(2, 0);
+        setInvitedUsernames(prev => ({ ...prev, [friend.username]: true }));
+        setStatusMsg({
+          text: `📩 تم إرسال دعوة مباشرة إلى «${friend.displayName}» (@${friend.username}) للانضمام إلى الغرفة #${codeToInvite}!`,
+          type: 'success'
+        });
+      } else {
+        sounds.playError();
+        setStatusMsg({ text: 'تعذر إرسال الدعوة حالياً', type: 'error' });
+      }
+    } catch {
+      sounds.playError();
+      setStatusMsg({ text: 'تعذر إرسال الدعوة حالياً', type: 'error' });
+    }
+  };
+
+  const handleAcceptInvite = async (invite: RoomInviteNotification) => {
+    sounds.playVictory();
+    try {
+      await Promise.all([
+        fetch('/api/friends/invites/dismiss', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: myUsername,
+            inviteId: invite.id,
+            roomCode: invite.roomCode
+          })
+        }).catch(() => null),
+        realtimeSync.dismissCloudRoomInvite(myUsername, invite.id, invite.roomCode).catch(() => null)
+      ]);
+    } catch {
+      // Ignore
+    }
+    if (onJoinRoomCode) {
+      onJoinRoomCode(invite.roomCode);
+      onClose();
+    }
+  };
+
+  const renderStatusBadge = (friend: FriendProfileSummary) => {
+    switch (friend.onlineStatus) {
+      case 'IN_ROOM':
+        return (
+          <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-amber-400/20 border border-amber-400/50 text-amber-300 text-[11px] font-black">
+            <span className="w-2 h-2 rounded-full bg-amber-400 animate-ping" />
+            <span>بانتظار منافس في غرفة #{friend.activeRoomCode}</span>
+          </span>
+        );
+      case 'IN_GAME':
+        return (
+          <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-purple-500/20 border border-purple-400/50 text-purple-300 text-[11px] font-black">
+            <span className="w-2 h-2 rounded-full bg-purple-400 animate-pulse" />
+            <span>يلعب مباراة الآن 🎮</span>
+          </span>
+        );
+      case 'ONLINE':
+        return (
+          <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-lime-400/20 border border-lime-400/50 text-lime-300 text-[11px] font-black">
+            <span className="w-2 h-2 rounded-full bg-lime-400 shadow-[0_0_8px_#a3e635]" />
+            <span>متصل الآن • جاهز للتحدي</span>
+          </span>
+        );
+      default:
+        return (
+          <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-slate-800 border border-slate-700 text-slate-400 text-[11px] font-bold">
+            <span className="w-2 h-2 rounded-full bg-slate-500" />
+            <span>غير متصل حالياً</span>
+          </span>
+        );
+    }
+  };
+
+  const onlineFriendsCount = friends.filter(f => f.onlineStatus !== 'OFFLINE').length;
+
+  return (
+    <div
+      dir="rtl"
+      className="fixed inset-0 z-50 bg-[#010a12]/85 backdrop-blur-md ios-modal-scroll select-none"
+    >
+      <div className="min-h-dvh w-full flex items-start sm:items-center justify-center px-2.5 pt-[max(calc(env(safe-area-inset-top,0px)+0.85rem),3.35rem)] pb-[calc(env(safe-area-inset-bottom,0px)+4.5rem)] sm:p-5">
+        <div
+          className="relative w-full max-w-[620px] rounded-[30px] sm:rounded-[36px] overflow-hidden animate-in zoom-in-95 duration-200 my-0 sm:my-auto max-h-[calc(100dvh-5rem)] sm:max-h-[92dvh] flex flex-col"
+        style={{
+          background: 'linear-gradient(180deg, #07253a 0%, #041624 50%, #020d16 100%)',
+          border: '2.5px solid #38bdf8',
+          boxShadow:
+            '0 0 42px rgba(56, 189, 248, 0.4), inset 0 0 24px rgba(14, 165, 233, 0.2), 0 20px 60px rgba(0, 0, 0, 0.9)'
+        }}
+      >
+        {/* Top Specular Neon Highlight */}
+        <div
+          className="pointer-events-none absolute inset-x-16 top-0 h-[3px] rounded-full"
+          style={{
+            background: 'linear-gradient(90deg, transparent 0%, #bae6fd 50%, transparent 100%)',
+            boxShadow: '0 0 18px 3px #38bdf8'
+          }}
+        />
+
+        {/* ==================== 1. HEADER ==================== */}
+        <div className="px-4 sm:px-6 pt-4 sm:pt-5 pb-3 border-b border-sky-500/25 flex items-center justify-between gap-2 shrink-0">
+          <div className="flex items-center gap-3">
+            <div className="w-11 h-11 rounded-2xl bg-gradient-to-b from-sky-400 to-blue-600 p-0.5 shadow-[0_0_15px_rgba(56,189,248,0.45)]">
+              <div className="w-full h-full rounded-[14px] bg-[#061e30] flex items-center justify-center text-sky-300">
+                <Users className="w-6 h-6" />
+              </div>
+            </div>
+            <div>
+              <div className="flex items-center gap-2">
+                <h2 className="text-lg sm:text-xl font-black text-white">الأصدقاء والدعوات</h2>
+                <span className="px-2.5 py-0.5 rounded-full bg-lime-400/20 border border-lime-400/40 text-lime-300 text-xs font-black">
+                  {onlineFriendsCount} متصل الآن
+                </span>
+              </div>
+              <p className="text-xs text-sky-200/80 font-bold">
+                أضف أصدقاءك بمعرفهم الفريد وادعهم مباشرة إلى غرفتك الخاصة!
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                sounds.playTap();
+                fetchFriendsData();
+              }}
+              className="w-9 h-9 rounded-full bg-[#0b2b40] hover:bg-[#123d59] border border-sky-400/40 flex items-center justify-center text-sky-300 transition-all cursor-pointer"
+              title="تحديث الحالة"
+            >
+              <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                sounds.playTap();
+                onClose();
+              }}
+              className="w-10 h-10 rounded-full bg-[#0d3349] hover:bg-[#144763] border border-[#5299be] flex items-center justify-center text-white transition-all cursor-pointer"
+              title="إغلاق"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
+        </div>
+
+        {/* ==================== SCROLLABLE BODY ==================== */}
+        <div className="p-4 sm:p-6 ios-modal-scroll space-y-4 flex-1">
+          {/* My Unique Username Banner */}
+          <div className="p-3.5 rounded-2xl bg-[#041421]/90 border border-sky-400/35 flex items-center justify-between gap-2 flex-wrap">
+            <div className="flex items-center gap-2.5">
+              <span className="text-xs font-bold text-slate-300">اسم المستخدم الفريد الخاص بك:</span>
+              <span
+                dir="ltr"
+                className="px-3 py-1 rounded-xl bg-sky-500/20 border border-sky-400/50 text-sky-200 font-mono font-black text-sm"
+              >
+                @{myUsername}
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={handleCopyMyUsername}
+              className="px-3 py-1.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-bold text-white flex items-center gap-1.5 border border-slate-600 transition-all cursor-pointer"
+            >
+              {copiedMyUsername ? (
+                <>
+                  <Check className="w-3.5 h-3.5 text-lime-400" />
+                  <span className="text-lime-400">تم نسخ المعرف</span>
+                </>
+              ) : (
+                <>
+                  <Copy className="w-3.5 h-3.5 text-sky-400" />
+                  <span>نسخ المعرف لمشاركته</span>
+                </>
+              )}
+            </button>
+          </div>
+
+          {/* Active Private Room Notice if user is currently hosting/waiting */}
+          {activeRoomCode && (
+            <div className="p-3 rounded-2xl bg-lime-500/15 border border-lime-400/40 flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 text-xs font-black text-lime-200">
+                <Lock className="w-4 h-4 text-lime-400 shrink-0" />
+                <span>
+                  غرفتك الحالية جاهزة (#{activeRoomCode}) — اضغط «دعوة للغرفة» بجانب أي صديق لإرسال دعوة فورية!
+                </span>
+              </div>
+            </div>
+          )}
+
+          {/* Incoming Direct Room Invitations */}
+          {pendingInvites.length > 0 && (
+            <div className="space-y-2">
+              <div className="text-xs font-black text-amber-300 flex items-center gap-1.5">
+                <Sparkles className="w-4 h-4 text-amber-400" />
+                <span>دعوات الغرف الخاصة الواردة ({pendingInvites.length}):</span>
+              </div>
+              {pendingInvites.map(inv => (
+                <div
+                  key={inv.id}
+                  className="p-3.5 rounded-2xl bg-gradient-to-r from-amber-500/20 via-emerald-500/15 to-sky-500/20 border-2 border-amber-400/60 flex items-center justify-between gap-3 flex-wrap shadow-lg"
+                >
+                  <div className="flex items-center gap-3">
+                    <img
+                      src={inv.fromAvatar}
+                      alt={inv.fromDisplayName}
+                      className="w-11 h-11 rounded-full object-cover border-2 border-amber-400"
+                    />
+                    <div>
+                      <div className="text-sm font-black text-white">
+                        {inv.fromDisplayName}{' '}
+                        <span dir="ltr" className="text-xs font-mono text-amber-300">
+                          (@{inv.fromUsername})
+                        </span>
+                      </div>
+                      <div className="text-xs text-slate-200 font-bold">
+                        يدعوك إلى «{inv.roomName}» • رمز الغرفة:{' '}
+                        <span className="font-mono font-black text-sky-300">#{inv.roomCode}</span>
+                      </div>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => handleAcceptInvite(inv)}
+                    className="px-4 py-2 rounded-xl bg-gradient-to-b from-[#d9ff43] to-[#65a30d] text-slate-950 font-black text-xs flex items-center gap-1.5 shadow-md hover:brightness-105 active:scale-95 transition-all cursor-pointer"
+                  >
+                    <Play className="w-4 h-4 fill-current" />
+                    <span>قبول والانضمام فوراً</span>
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Add Friend by Unique Username Input */}
+          <div className="p-4 rounded-2xl bg-[#051a2b] border border-sky-400/40 space-y-3">
+            <label className="block text-xs sm:text-sm font-black text-white flex items-center gap-1.5">
+              <UserPlus className="w-4 h-4 text-sky-400" />
+              <span>إضافة صديق عبر اسم المستخدم الفريد (Username):</span>
+            </label>
+
+            <div className="flex items-center gap-2">
+              <div className="relative flex-1">
+                <Search className="w-4 h-4 text-sky-400 absolute right-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                <input
+                  type="text"
+                  dir="ltr"
+                  value={usernameInput}
+                  onChange={e => setUsernameInput(e.target.value)}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter') {
+                      handleAddFriend();
+                    }
+                  }}
+                  placeholder="dana_q8, fahad_q8, sara_kwt..."
+                  className="w-full h-11 pr-10 pl-3 rounded-xl bg-[#03111c] border border-sky-500/45 focus:border-sky-300 text-white font-mono text-sm focus:outline-none"
+                />
+              </div>
+              <button
+                type="button"
+                onClick={() => handleAddFriend()}
+                className="h-11 px-4 sm:px-5 rounded-xl bg-gradient-to-b from-[#a3e635] to-[#4d7c0f] hover:brightness-110 text-slate-950 font-black text-xs sm:text-sm flex items-center gap-1.5 shadow-lg active:scale-95 transition-all cursor-pointer shrink-0"
+              >
+                <UserPlus className="w-4 h-4" />
+                <span>إضافة صديق</span>
+              </button>
+            </div>
+
+            {/* Live Search Autocomplete Matches */}
+            {searchResults.length > 0 && (
+              <div className="rounded-xl bg-[#03101a] border border-sky-500/30 divide-y divide-slate-800/80 overflow-hidden">
+                {searchResults.map(sr => (
+                  <div
+                    key={sr.username}
+                    className="p-2.5 flex items-center justify-between gap-2 hover:bg-sky-500/10 transition-colors"
+                  >
+                    <div className="flex items-center gap-2.5">
+                      <img
+                        src={sr.avatar}
+                        alt={sr.displayName}
+                        className="w-9 h-9 rounded-full object-cover border border-sky-400"
+                      />
+                      <div>
+                        <div className="text-xs font-black text-white">{sr.displayName}</div>
+                        <div dir="ltr" className="text-[11px] font-mono text-sky-400">
+                          @{sr.username}
+                        </div>
+                      </div>
+                    </div>
+                    {sr.isFriend ? (
+                      <span className="text-[11px] font-bold text-lime-400 px-2.5 py-1 rounded-lg bg-lime-400/10">
+                        ✓ صديق بالفعل
+                      </span>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => handleAddFriend(sr.username)}
+                        className="px-3 py-1.5 rounded-lg bg-sky-500 hover:bg-sky-400 text-slate-950 font-black text-xs flex items-center gap-1 cursor-pointer"
+                      >
+                        <UserPlus className="w-3.5 h-3.5" />
+                        <span>إضافة @{sr.username}</span>
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {/* Status Feedback Message */}
+            {statusMsg && (
+              <div
+                className={`p-2.5 rounded-xl text-xs font-bold border ${
+                  statusMsg.type === 'success'
+                    ? 'bg-emerald-500/15 border-emerald-400/50 text-emerald-200'
+                    : 'bg-rose-500/15 border-rose-400/50 text-rose-200'
+                }`}
+              >
+                {statusMsg.text}
+              </div>
+            )}
+          </div>
+
+          {/* ==================== MY FRIENDS LIST ==================== */}
+          <div className="space-y-2.5">
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-black text-white flex items-center gap-1.5">
+                <Users className="w-4 h-4 text-sky-400" />
+                <span>قائمة أصدقائك ({friends.length})</span>
+              </h3>
+              <span className="text-[11px] text-slate-400 font-bold">
+                تتحدث حالة الاتصال والغرف تلقائياً
+              </span>
+            </div>
+
+            {friends.length === 0 ? (
+              <div className="p-6 rounded-2xl bg-[#041421]/60 border border-dashed border-slate-700 text-center text-xs text-slate-400">
+                لا يوجد أصدقاء مضافون بعد. أضف أصدقاءك عبر اسم المستخدم الفريد في الأعلى أو من المقترحات بالأسفل!
+              </div>
+            ) : (
+              <div className="space-y-2.5">
+                {friends.map(friend => {
+                  const wasInvited = invitedUsernames[friend.username];
+                  return (
+                    <div
+                      key={friend.username}
+                      className="p-3.5 rounded-2xl bg-[#051a2b]/95 border border-sky-500/35 hover:border-sky-400/60 transition-all flex items-center justify-between gap-3 flex-wrap"
+                    >
+                      <div className="flex items-center gap-3 min-w-0">
+                        <div className="relative shrink-0">
+                          <img
+                            src={friend.avatar}
+                            alt={friend.displayName}
+                            className="w-12 h-12 rounded-full object-cover border-2 border-sky-400"
+                          />
+                          <span
+                            className={`absolute bottom-0 right-0 w-3.5 h-3.5 rounded-full border-2 border-[#051a2b] ${
+                              friend.onlineStatus === 'ONLINE'
+                                ? 'bg-lime-400'
+                                : friend.onlineStatus === 'IN_ROOM'
+                                ? 'bg-amber-400'
+                                : friend.onlineStatus === 'IN_GAME'
+                                ? 'bg-purple-400'
+                                : 'bg-slate-500'
+                            }`}
+                          />
+                        </div>
+
+                        <div className="min-w-0">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="text-sm font-black text-white truncate">
+                              {friend.displayName}
+                            </span>
+                            <span
+                              dir="ltr"
+                              className="px-2 py-0.5 rounded-md bg-slate-900 border border-slate-700 text-[11px] font-mono font-bold text-sky-300"
+                            >
+                              @{friend.username}
+                            </span>
+                            <span className="text-[11px] font-bold text-amber-300">
+                              🏆 {friend.multiplayerWins} فوز
+                            </span>
+                          </div>
+                          <div className="mt-1">{renderStatusBadge(friend)}</div>
+                        </div>
+                      </div>
+
+                      {/* Friend Action Buttons: Join their Room OR Invite to Private Room */}
+                      <div className="flex items-center gap-2 mr-auto">
+                        {friend.onlineStatus === 'IN_ROOM' &&
+                          friend.activeRoomCode &&
+                          friend.activeRoomCode !== activeRoomCode &&
+                          onJoinRoomCode && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                sounds.playTap();
+                                onJoinRoomCode(friend.activeRoomCode!);
+                                onClose();
+                              }}
+                              className="px-3 py-2 rounded-xl bg-gradient-to-b from-amber-300 to-amber-500 text-slate-950 font-black text-xs flex items-center gap-1.5 shadow-md hover:brightness-105 active:scale-95 transition-all cursor-pointer"
+                            >
+                              <Wifi className="w-3.5 h-3.5" />
+                              <span>انضم لغرفته #{friend.activeRoomCode}</span>
+                            </button>
+                          )}
+
+                        <button
+                          type="button"
+                          onClick={() => handleSendDirectInvite(friend)}
+                          className={`px-3.5 py-2 rounded-xl font-black text-xs flex items-center gap-1.5 transition-all cursor-pointer ${
+                            wasInvited
+                              ? 'bg-emerald-500/25 border border-emerald-400 text-emerald-200'
+                              : 'bg-gradient-to-b from-[#38bdf8] to-[#0284c7] hover:brightness-110 text-slate-950 shadow-md active:scale-95'
+                          }`}
+                        >
+                          {wasInvited ? (
+                            <>
+                              <Check className="w-3.5 h-3.5" />
+                              <span>تم إرسال الدعوة</span>
+                            </>
+                          ) : (
+                            <>
+                              <Send className="w-3.5 h-3.5" />
+                              <span>
+                                {activeRoomCode
+                                  ? `دعوة للغرفة #${activeRoomCode}`
+                                  : 'دعوة لغرفة خاصة 🔒'}
+                              </span>
+                            </>
+                          )}
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => handleRemoveFriend(friend.username, friend.displayName)}
+                          className="p-2 rounded-xl bg-slate-900 hover:bg-rose-500/20 text-slate-400 hover:text-rose-300 border border-slate-800 transition-colors cursor-pointer"
+                          title="إزالة من الأصدقاء"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                        {currentUser?.username && (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setReportTarget({
+                                  username: friend.username,
+                                  displayName: friend.displayName
+                                })
+                              }
+                              className="p-2 rounded-xl bg-slate-900 hover:bg-rose-500/20 text-slate-400 hover:text-rose-300 border border-slate-800 transition-colors cursor-pointer"
+                              title="الإبلاغ عن اللاعب"
+                            >
+                              <Flag className="w-4 h-4" />
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleBlockPlayer(friend.username, friend.displayName)}
+                              className="p-2 rounded-xl bg-slate-900 hover:bg-rose-500/20 text-slate-400 hover:text-rose-300 border border-slate-800 transition-colors cursor-pointer"
+                              title="حظر اللاعب"
+                            >
+                              <Ban className="w-4 h-4" />
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          {/* ==================== SUGGESTED PLAYERS TO ADD ==================== */}
+          {suggestions.length > 0 && (
+            <div className="space-y-2 pt-2 border-t border-slate-800/80">
+              <span className="text-xs font-black text-sky-300 block">
+                لاعبون مقترحون في فتّشها (إضافة سريعة بالمعرف الفريد):
+              </span>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                {suggestions.map(sug => (
+                  <div
+                    key={sug.username}
+                    className="p-2.5 rounded-2xl bg-[#04131f] border border-slate-800 flex items-center justify-between gap-2"
+                  >
+                    <div className="flex items-center gap-2.5 min-w-0">
+                      <img
+                        src={sug.avatar}
+                        alt={sug.displayName}
+                        className="w-9 h-9 rounded-full object-cover border border-sky-400/60 shrink-0"
+                      />
+                      <div className="min-w-0">
+                        <div className="text-xs font-black text-white truncate">
+                          {sug.displayName}
+                        </div>
+                        <div dir="ltr" className="text-[11px] font-mono text-sky-400 truncate">
+                          @{sug.username}
+                        </div>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-1 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => handleAddFriend(sug.username)}
+                        className="px-3 py-1.5 rounded-xl bg-sky-500/20 hover:bg-sky-500/35 border border-sky-400/50 text-sky-200 font-black text-xs flex items-center gap-1 transition-all cursor-pointer"
+                      >
+                        <UserPlus className="w-3.5 h-3.5" />
+                        <span>إضافة</span>
+                      </button>
+                      {currentUser?.username && (
+                        <>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setReportTarget({
+                                username: sug.username,
+                                displayName: sug.displayName
+                              })
+                            }
+                            className="p-1.5 rounded-xl bg-slate-900 hover:bg-rose-500/20 text-slate-400 hover:text-rose-300 border border-slate-800 cursor-pointer"
+                            title="إبلاغ"
+                          >
+                            <Flag className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleBlockPlayer(sug.username, sug.displayName)}
+                            className="p-1.5 rounded-xl bg-slate-900 hover:bg-rose-500/20 text-slate-400 hover:text-rose-300 border border-slate-800 cursor-pointer"
+                            title="حظر"
+                          >
+                            <Ban className="w-3.5 h-3.5" />
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* ==================== BLOCKED PLAYERS MANAGEMENT ==================== */}
+          {currentUser?.username && (
+            <div className="pt-2 border-t border-slate-800/80 space-y-2">
+              <button
+                type="button"
+                onClick={() => setShowBlockedList(prev => !prev)}
+                className="w-full px-3.5 py-2 rounded-xl bg-[#04131f] border border-slate-800 hover:border-rose-400/40 flex items-center justify-between text-xs font-black text-slate-300 cursor-pointer"
+              >
+                <span className="flex items-center gap-1.5">
+                  <Ban className="w-3.5 h-3.5 text-rose-400" />
+                  <span>قائمة المحظورين ({blockedUsers.length})</span>
+                </span>
+                <span className="text-[11px] text-sky-400">
+                  {showBlockedList ? 'إخفاء' : 'عرض وإدارة'}
+                </span>
+              </button>
+
+              {showBlockedList && (
+                <div className="space-y-2">
+                  {blockedUsers.length === 0 ? (
+                    <div className="p-3 rounded-xl bg-[#04131f] border border-slate-800 text-[11px] text-slate-400 text-center">
+                      لا يوجد لاعبون محظورون حالياً
+                    </div>
+                  ) : (
+                    blockedUsers.map(b => (
+                      <div
+                        key={b.username}
+                        className="p-2.5 rounded-xl bg-[#04131f] border border-rose-500/30 flex items-center justify-between gap-2"
+                      >
+                        <div className="flex items-center gap-2 min-w-0">
+                          <img
+                            src={b.avatar}
+                            alt={b.displayName}
+                            className="w-8 h-8 rounded-full object-cover border border-rose-400/50 shrink-0"
+                          />
+                          <div className="min-w-0">
+                            <div className="text-xs font-black text-white truncate">{b.displayName}</div>
+                            <div dir="ltr" className="text-[10px] font-mono text-slate-400 truncate">
+                              @{b.username}
+                            </div>
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => handleUnblockPlayer(b.username, b.displayName)}
+                          className="px-2.5 py-1 rounded-lg bg-slate-800 hover:bg-emerald-500/20 border border-slate-700 hover:border-emerald-400/50 text-[11px] font-black text-slate-200 flex items-center gap-1 cursor-pointer shrink-0"
+                        >
+                          <ShieldOff className="w-3 h-3" />
+                          <span>إلغاء الحظر</span>
+                        </button>
+                      </div>
+                    ))
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+      </div>
+
+      {reportTarget && (
+        <ReportPlayerModal
+          isOpen={true}
+          onClose={() => setReportTarget(null)}
+          currentUser={currentUser}
+          targetUsername={reportTarget.username}
+          targetDisplayName={reportTarget.displayName}
+          context="FRIENDS"
+          onReported={(updatedUser) => {
+            if (updatedUser && onUpdateUser) onUpdateUser(updatedUser);
+            fetchFriendsData();
+          }}
+        />
+      )}
+    </div>
+  );
+};

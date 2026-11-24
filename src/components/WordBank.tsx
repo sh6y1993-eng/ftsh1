@@ -1,0 +1,155 @@
+import React from 'react';
+import { WordPlacement } from '../types/game';
+import { Check, Zap, Lightbulb } from 'lucide-react';
+
+interface WordBankProps {
+  wordPlacements: WordPlacement[];
+  foundWords: string[];
+  playerColorMap?: Record<string, string>;
+  playerNamesMap?: Record<string, string>;
+  playerIdsMap?: Record<string, string>;
+  currentPlayerId?: string;
+  currentPlayerName?: string;
+  hintWord?: string | null;
+  showWordLengths?: boolean;
+  maskUnfoundWords?: boolean;
+  maskedSeconds?: number;
+}
+
+export const WordBank: React.FC<WordBankProps> = ({
+  wordPlacements,
+  foundWords,
+  playerColorMap = {},
+  playerNamesMap = {},
+  playerIdsMap = {},
+  currentPlayerId,
+  currentPlayerName,
+  hintWord,
+  showWordLengths = false,
+  maskUnfoundWords = false,
+  maskedSeconds = 0
+}) => {
+  const remainingCount = Math.max(0, wordPlacements.length - foundWords.length);
+
+  return (
+    <div
+      className="w-full rounded-2xl p-3.5 sm:p-4 relative isolate"
+      style={{
+        background: 'linear-gradient(180deg, #092034 0%, #041220 100%)',
+        border: '1.5px solid rgba(56, 189, 248, 0.45)',
+        boxShadow: '0 0 24px rgba(14, 165, 233, 0.18), inset 0 1px 1px rgba(255, 255, 255, 0.14)',
+        transform: 'translateZ(0)',
+        WebkitTransform: 'translateZ(0)'
+      }}
+      dir="rtl"
+    >
+      {/* Top Header Row */}
+      <div className="relative z-10 flex items-center justify-between pb-2.5 mb-3 border-b border-cyan-400/20 text-xs sm:text-sm flex-wrap gap-2">
+        <div className="flex items-center gap-2">
+          <span className="font-black text-white tracking-wide">الكلمات المطلوبة:</span>
+          <span
+            className="text-xs font-black text-amber-300 px-3 py-0.5 rounded-full tabular-nums"
+            style={{
+              background: 'rgba(245, 158, 11, 0.16)',
+              border: '1px solid rgba(251, 191, 36, 0.65)',
+              boxShadow: '0 0 10px rgba(245, 158, 11, 0.2)'
+            }}
+          >
+            {foundWords.length} من {wordPlacements.length}
+          </span>
+        </div>
+
+        <span className="text-xs sm:text-sm font-bold text-slate-200 tabular-nums">
+          {maskUnfoundWords
+            ? `🙈 الخصم أخفى الكلمات (${maskedSeconds}ث)!`
+            : remainingCount === 0
+            ? 'تم صيد جميع الكلمات! 🎉'
+            : `متبقي ${remainingCount} كلمات للصيد`}
+        </span>
+      </div>
+
+      {/* Centered Word Capsules */}
+      <div className="relative z-10 flex flex-wrap gap-2 sm:gap-3 justify-center items-center py-0.5">
+        {wordPlacements.map((placement, index) => {
+          const isFound = foundWords.includes(placement.word);
+          const isHinted = !isFound && hintWord === placement.word;
+          const color = playerColorMap[placement.word] || placement.color;
+          const claimedBy = playerNamesMap[placement.word];
+          const claimedById = playerIdsMap[placement.word] || placement.foundBy;
+          const isMine = Boolean(
+            claimedById && currentPlayerId
+              ? claimedById === currentPlayerId
+              : claimedBy && currentPlayerName && claimedBy === currentPlayerName
+          );
+
+          return (
+            <div
+              key={`${placement.word}_${index}`}
+              className={`relative z-10 px-3.5 sm:px-5 py-1.5 rounded-full text-sm sm:text-base font-extrabold flex items-center gap-1.5 transition-colors duration-150 select-none max-w-full ${
+                isFound
+                  ? 'text-white'
+                  : isHinted
+                  ? 'text-slate-950 ring-4 ring-amber-300/80 animate-pulse z-20'
+                  : 'text-white'
+              }`}
+              style={
+                isFound
+                  ? {
+                      backgroundColor: color,
+                      border: '1.5px solid rgba(255,255,255,0.55)',
+                      boxShadow: `0 0 16px ${color}88, inset 0 1px 1px rgba(255,255,255,0.35)`,
+                      transform: 'translateZ(0)',
+                      WebkitTransform: 'translateZ(0)'
+                    }
+                  : isHinted
+                  ? {
+                      background: 'linear-gradient(135deg, #fde047 0%, #38bdf8 100%)',
+                      border: '2px solid #ffffff',
+                      boxShadow: '0 0 22px rgba(250, 204, 21, 0.85)',
+                      transform: 'translateZ(0)',
+                      WebkitTransform: 'translateZ(0)'
+                    }
+                  : {
+                      background: 'linear-gradient(180deg, #163854 0%, #0b2135 100%)',
+                      border: '1.5px solid rgba(125, 211, 252, 0.45)',
+                      boxShadow: '0 3px 8px rgba(0, 0, 0, 0.45), inset 0 1px 1px rgba(255, 255, 255, 0.22)',
+                      transform: 'translateZ(0)',
+                      WebkitTransform: 'translateZ(0)'
+                    }
+              }
+            >
+              {isFound && (
+                isMine ? (
+                  <Check className="w-4 h-4 shrink-0 stroke-[3]" />
+                ) : (
+                  <Zap className="w-4 h-4 shrink-0 fill-current" />
+                )
+              )}
+              {isHinted && <Lightbulb className="w-4 h-4 shrink-0 text-slate-950 fill-amber-400" />}
+              <span className={isFound ? 'line-through decoration-2' : ''}>
+                {!isFound && maskUnfoundWords
+                  ? '•'.repeat(Math.max(3, placement.displayWord.length))
+                  : placement.displayWord}
+              </span>
+              {!isFound && showWordLengths && (
+                <span className="text-[11px] bg-cyan-500/25 border border-cyan-300/50 text-cyan-200 px-2 py-0.5 rounded-full font-mono font-black">
+                  {placement.word.length} حروف
+                </span>
+              )}
+              {isHinted && (
+                <span className="text-[10px] bg-slate-950 text-amber-300 px-2 py-0.5 rounded-full mr-1 font-black">
+                  تلميح 💡
+                </span>
+              )}
+              {claimedBy && (
+                <span className="text-[10px] sm:text-[11px] bg-black/40 px-2 py-0.5 rounded-full mr-1 font-black border border-white/25 whitespace-nowrap truncate max-w-[150px] sm:max-w-none">
+                  {isMine ? `✓ صدتها أنت` : `✗ صادها: ${claimedBy}`}
+                </span>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+};
